@@ -136,8 +136,11 @@ const serverApi = {
   /** Dynamic groups anywhere in the tenant naming an enrollment profile no profile has. */
   profileNameWarnings: () => getJson<ProfileNameWarning[]>("/profile-name-warnings"),
   /** "Load a real device": devices whose name starts with `query`. */
-  searchDevices: (query: string, signal?: AbortSignal) =>
-    getJson<DeviceSearchResponse>(`/devices?search=${encodeURIComponent(query)}`, signal),
+  searchDevices: (query: string, signal?: AbortSignal, includeInactive = false) =>
+    getJson<DeviceSearchResponse>(
+      `/devices?search=${encodeURIComponent(query)}${includeInactive ? "&includeInactive=true" : ""}`,
+      signal
+    ),
   /** The groups a device is in, and its OS and Autopilot facts. */
   deviceMembership: (id: string) => getJson<DeviceMembershipResponse>(`/devices/${encodeURIComponent(id)}/membership`),
   unassignedPolicies: () => getJson<UnassignedPolicy[]>("/unassigned"),

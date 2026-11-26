@@ -248,8 +248,14 @@ export function createLiveApi(deps: LiveApiDeps) {
     filters: async () => listAssignmentFilters(await tenant()),
     // Live reads under the signed-in admin's own token, like the tenant load.
     // Not part of the cached tenant: the point is the device as it is now.
-    searchDevices: async (query: string, _signal?: AbortSignal): Promise<DeviceSearchResponse> =>
-      (await ensureMode()) === "demo" ? { unavailable: DEVICE_LOOKUP_DEMO } : searchDevices(client, query),
+    searchDevices: async (
+      query: string,
+      _signal?: AbortSignal,
+      includeInactive = false
+    ): Promise<DeviceSearchResponse> =>
+      (await ensureMode()) === "demo"
+        ? { unavailable: DEVICE_LOOKUP_DEMO }
+        : searchDevices(client, query, includeInactive),
     deviceMembership: async (id: string): Promise<DeviceMembershipResponse> =>
       (await ensureMode()) === "demo" ? { unavailable: DEVICE_LOOKUP_DEMO } : readDeviceMembership(client, id),
     unassignedPolicies: async () => listUnassignedPolicies(await tenant()),

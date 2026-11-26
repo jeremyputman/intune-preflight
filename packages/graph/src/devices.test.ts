@@ -57,6 +57,19 @@ describe("isActiveIntuneDevice", () => {
     expect(isActiveIntuneDevice(MANAGED, NOW)).toBe(true);
   });
 
+  it("keeps a null management flag with an explicit Intune app id", () => {
+    expect(isActiveIntuneDevice({ ...MANAGED, isManaged: null, mdmAppId: INTUNE.toUpperCase() }, NOW)).toBe(true);
+  });
+
+  it.each([undefined, null, "", DEVICE_ID])("rejects a null management flag with MDM app id %s", (mdmAppId) => {
+    expect(isActiveIntuneDevice({ ...MANAGED, isManaged: null, mdmAppId }, NOW)).toBe(false);
+  });
+
+  it("distinguishes an omitted flag from an explicit null and preserves managed devices without an MDM id", () => {
+    expect(isActiveIntuneDevice({ accountEnabled: true, mdmAppId: INTUNE }, NOW)).toBe(false);
+    expect(isActiveIntuneDevice({ ...MANAGED, mdmAppId: null }, NOW)).toBe(true);
+  });
+
   it("drops registered-only, disabled, other-MDM and stale devices", () => {
     expect(isActiveIntuneDevice({ ...MANAGED, isManaged: false }, NOW)).toBe(false);
     expect(isActiveIntuneDevice({ accountEnabled: true }, NOW)).toBe(false);
@@ -77,7 +90,7 @@ describe("searchDevices", () => {
     const client = fakeClient({
       "/devices?": {
         value: [
-          { id: "m", displayName: "KIOSK-M", operatingSystem: "Windows", ...MANAGED },
+          { id: "m", displayName: "KIOSK-M", operatingSystem: "iOS", ...MANAGED, isManaged: null },
           { id: "r", displayName: "KIOSK-R", operatingSystem: "Windows", accountEnabled: true, isManaged: false },
           { id: "d", displayName: "KIOSK-D", operatingSystem: "Windows", ...MANAGED, accountEnabled: false },
         ],
@@ -85,7 +98,31 @@ describe("searchDevices", () => {
     });
     const res = await searchDevices(client, "kiosk");
     expect(client.paths[0]).toContain("isManaged");
-    expect(res).toEqual({ devices: [{ id: "m", displayName: "KIOSK-M", operatingSystem: "Windows" }], hidden: 2 });
+    expect(res).toEqual({ devices: [{ id: "m", displayName: "KIOSK-M", operatingSystem: "iOS" }], hidden: 2 });
+  });
+
+  it("only relaxes the sign-in cutoff when inactive devices are requested", async () => {
+    const client = fakeClient({
+      "/devices?": {
+        value: [
+          {
+            id: "s",
+            displayName: "KIOSK-STALE",
+            ...MANAGED,
+            isManaged: null,
+            approximateLastSignInDateTime: "2000-01-01T00:00:00Z",
+          },
+          { id: "d", displayName: "KIOSK-DISABLED", ...MANAGED, isManaged: null, accountEnabled: false },
+          { id: "r", displayName: "KIOSK-REGISTERED", ...MANAGED, isManaged: false },
+          { id: "o", displayName: "KIOSK-OTHER", ...MANAGED, mdmAppId: DEVICE_ID },
+        ],
+      },
+    });
+    expect(await searchDevices(client, "kiosk")).toEqual({ devices: [], hidden: 4 });
+    expect(await searchDevices(client, "kiosk", true)).toEqual({
+      devices: [{ id: "s", displayName: "KIOSK-STALE" }],
+      hidden: 3,
+    });
   });
 
   it("filters by name prefix, escaping quotes, and sorts the results", async () => {

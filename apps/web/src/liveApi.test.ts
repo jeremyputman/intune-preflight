@@ -182,6 +182,33 @@ describe("reading a connected tenant", () => {
     expect(fetchMock.mock.calls.length).toBeGreaterThan(afterFirst);
   });
 
+  it("passes the inactive-device option through to the live Graph search", async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        value: [
+          {
+            id: "stale",
+            displayName: "KIOSK-STALE",
+            isManaged: null,
+            mdmAppId: "0000000a-0000-0000-c000-000000000000",
+            approximateLastSignInDateTime: "2000-01-01T00:00:00Z",
+          },
+        ],
+      }),
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const api = createLiveApi(deps());
+    await api.setMode("connected");
+
+    expect(await api.searchDevices("kiosk")).toEqual({ devices: [], hidden: 1 });
+    expect(await api.searchDevices("kiosk", undefined, true)).toEqual({
+      devices: [{ id: "stale", displayName: "KIOSK-STALE" }],
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   // "Last refresh" in the header: the refresh reports when its read finished,
   // and health reports the same time afterwards, so the two cannot disagree.
   it("reports when the connected tenant was read, and only for connected", async () => {

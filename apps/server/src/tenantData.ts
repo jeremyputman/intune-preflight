@@ -98,8 +98,8 @@ export function getLastLoadedAt(): string | undefined {
 }
 
 /** "Load a real device": a live Graph read, never cached -- the point is the device as it is now. */
-export function findDevices(query: string): Promise<DeviceSearchResponse> {
-  return searchDevices(client, query);
+export function findDevices(query: string, includeInactive = false): Promise<DeviceSearchResponse> {
+  return searchDevices(client, query, includeInactive);
 }
 
 export function deviceMembership(id: string): Promise<DeviceMembershipResponse> {

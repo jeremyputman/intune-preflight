@@ -99,9 +99,9 @@ export async function buildServer({ logger = true }: { logger?: boolean } = {}) 
 
   // "Load a real device". Read live from Graph on each call; the sample tenant
   // has no devices, so demo mode answers `unavailable` rather than an error.
-  app.get<{ Querystring: { search?: string } }>("/api/devices", async (req) => {
+  app.get<{ Querystring: { search?: string; includeInactive?: string } }>("/api/devices", async (req) => {
     if (getMode() === "demo") return { unavailable: DEVICE_LOOKUP_DEMO };
-    return findDevices(String(req.query.search ?? "").slice(0, 100));
+    return findDevices(String(req.query.search ?? "").slice(0, 100), req.query.includeInactive === "true");
   });
 
   app.get<{ Params: { id: string } }>("/api/devices/:id/membership", async (req) => {

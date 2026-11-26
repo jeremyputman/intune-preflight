@@ -60,16 +60,17 @@ function toResult(raw: Record<string, unknown>): DeviceSearchResult {
   };
 }
 
-/**
- * Whether a device is one Intune actively manages: enabled in Entra, enrolled
- * in an MDM, and that MDM is Intune (not Configuration Manager alone or a
- * third-party MDM), and signed in within DEVICE_ACTIVE_DAYS days. A device
- * Entra has no sign-in time for is kept rather than guessed stale.
- */
-export function isActiveIntuneDevice(raw: Record<string, unknown>, now: number = Date.now()): boolean {
+function isEnabledIntuneDevice(raw: Record<string, unknown>): boolean {
   if (raw.accountEnabled === false) return false;
-  if (raw.isManaged !== true) return false;
-  if (typeof raw.mdmAppId === "string" && raw.mdmAppId.toLowerCase() !== INTUNE_MDM_APP_ID) return false;
+  const mdmAppId = typeof raw.mdmAppId === "string" ? raw.mdmAppId.toLowerCase() : undefined;
+  if (mdmAppId !== undefined && mdmAppId !== INTUNE_MDM_APP_ID) return false;
+  // Entra can supply the Intune app ID even when the management flag is null.
+  return raw.isManaged === true || (raw.isManaged === null && mdmAppId === INTUNE_MDM_APP_ID);
+}
+
+/** Keeps enabled Intune devices with recent or unknown Entra sign-in times. */
+export function isActiveIntuneDevice(raw: Record<string, unknown>, now: number = Date.now()): boolean {
+  if (!isEnabledIntuneDevice(raw)) return false;
   const lastSignIn =
     typeof raw.approximateLastSignInDateTime === "string" ? Date.parse(raw.approximateLastSignInDateTime) : NaN;
   if (!Number.isNaN(lastSignIn) && now - lastSignIn > DEVICE_ACTIVE_DAYS * 86_400_000) return false;
@@ -77,12 +78,17 @@ export function isActiveIntuneDevice(raw: Record<string, unknown>, now: number =
 }
 
 /**
- * Active, Intune-managed devices whose display name starts with `query`. A
+ * Enabled Intune-managed devices whose display name starts with `query`.
+ * By default, devices with an older Entra sign-in are hidden. A
  * prefix match is what the devices collection filters without advanced-query
  * headers, and device names are usually typed from their start; the
  * management filter runs here, on what Graph returns, for the same reason.
  */
-export async function searchDevices(client: GraphClient, query: string): Promise<DeviceSearchResponse> {
+export async function searchDevices(
+  client: GraphClient,
+  query: string,
+  includeInactive = false
+): Promise<DeviceSearchResponse> {
   const text = query.trim();
   if (text.length < 2) return { devices: [] };
   // OData escapes a quote by doubling it; nothing else in a name can leave the literal.
@@ -92,7 +98,8 @@ export async function searchDevices(client: GraphClient, query: string): Promise
       `/devices?$filter=startswith(displayName,'${encodeURIComponent(literal)}')&$select=${DEVICE_FIELDS},${MANAGEMENT_FIELDS}&$top=${SEARCH_READ}`
     );
     const all = page?.value ?? [];
-    const kept = all.filter((raw) => isActiveIntuneDevice(raw));
+    const now = Date.now();
+    const kept = all.filter((raw) => (includeInactive ? isEnabledIntuneDevice(raw) : isActiveIntuneDevice(raw, now)));
     const devices = kept.map(toResult);
     devices.sort((a, b) => a.displayName.localeCompare(b.displayName, undefined, { sensitivity: "base" }));
     const hidden = all.length - kept.length;
