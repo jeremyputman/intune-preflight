@@ -193,6 +193,33 @@ If the deployed URL isn't `origin` + the `--base` path (a reverse proxy, say), s
 `VITE_REDIRECT_URI` at build time to the exact string registered in Entra; otherwise it is derived
 and you don't need it.
 
+#### Persistent browser snapshots
+
+Enable the local snapshot cache explicitly in a reviewed browser build:
+
+```bash
+VITE_PERSIST_TENANT_CACHE=1 PREFLIGHT_LIVE_BASE=/ npm run build:live
+```
+
+Use the same base path and redirect settings as your existing deployment. To verify eligibility, the
+app needs the Entra app registration to emit tenant-wide directory roles in the ID token
+(`wids`). For a dedicated registration that does not already emit the claim, see
+[Microsoft's directory role claims guidance](https://learn.microsoft.com/en-us/entra/identity/hybrid/connect/how-to-connect-fed-group-claims).
+Review any manifest change with the registration owner. This feature uses existing delegated Graph
+permissions and only persists snapshots for existing Intune Administrators whose role and Graph
+access can be verified. Accounts using scoped Intune roles can still load tenant data for the tab.
+
+Choose **Refresh from Intune** to load the first snapshot. A later sign-in can reuse it after an
+online authorization check. The snapshot retains the original load time. Failed or incomplete
+refreshes preserve an existing complete snapshot while authorization is still valid. Device
+lookups remain live.
+
+Use **Clear local cache** in the session menu to delete the active snapshot. **End session** also
+deletes it and ends matching sessions in other open tabs. Closing a tab alone retains the snapshot.
+Use a dedicated managed browser profile and test sign-out, a second account, permission revocation,
+and offline behavior before enabling the feature on a production site. IndexedDB is local to the
+browser profile and origin. Browser settings can clear all the site's data.
+
 ---
 
 # Self-hosted

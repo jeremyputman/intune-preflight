@@ -13,7 +13,8 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { demoApi } from "./demoApi.ts";
-import { createLiveApi, type LiveApiDeps } from "./liveApi.ts";
+import { createLiveApi, type LiveApiDeps, type PersistentTenantCache } from "./liveApi.ts";
+import { CacheAccessDenied, type CacheEntry } from "./tenantCache.ts";
 
 function deps(overrides: Partial<LiveApiDeps> = {}): LiveApiDeps {
   return {
@@ -101,6 +102,140 @@ describe("setMode", () => {
     const api = createLiveApi(deps({ ensureSignedIn }));
     await api.setMode("demo");
     expect(ensureSignedIn).not.toHaveBeenCalled();
+  });
+});
+
+describe("persistent tenant snapshots", () => {
+  const tenant = {
+    policies: [],
+    groups: [],
+    autopilotProfiles: [],
+    assignmentFilters: [],
+    loadedAt: "2026-11-25T00:00:00.000Z",
+  };
+
+  function cache(initial?: CacheEntry) {
+    const entries = new Map<string, CacheEntry>();
+    if (initial) entries.set("tenant:user", initial);
+    const persistence = {
+      key: vi.fn(() => "tenant:user"),
+      authorize: vi.fn<PersistentTenantCache["authorize"]>(async () => true),
+      notifyPurge: vi.fn(),
+      storage: {
+        read: vi.fn(async (key: string) => entries.get(key) ?? { revision: "" }),
+        write: vi.fn<PersistentTenantCache["storage"]["write"]>(async (key, revision, data) => {
+          if ((entries.get(key)?.revision ?? "") !== revision) return false;
+          entries.set(key, { revision, data });
+          return true;
+        }),
+        clear: vi.fn(async (key: string) => {
+          entries.set(key, { revision: "cleared" });
+        }),
+      },
+    } satisfies PersistentTenantCache;
+    return { entries, persistence, api: createLiveApi(deps({ persistence })) };
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("requires a manual first download and reuses it after reopening", async () => {
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ value: [] }) }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { api, persistence } = cache();
+    await api.setMode("connected");
+    expect((await api.health()).loadedAt).toBeUndefined();
+    expect(fetchMock).not.toHaveBeenCalled();
+    const { loadedAt } = await api.refresh();
+    expect(loadedAt).toBeDefined();
+    expect(persistence.storage.write).toHaveBeenCalledTimes(1);
+
+    fetchMock.mockClear();
+    const reopened = createLiveApi(deps({ persistence }));
+    await reopened.setMode("connected");
+    expect((await reopened.health()).loadedAt).toBe(loadedAt);
+    expect(persistence.authorize).toHaveBeenLastCalledWith(true);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("isolates a different signed-in account from the stored snapshot", async () => {
+    const { api, persistence } = cache({ revision: "", data: tenant });
+    persistence.key.mockReturnValue("tenant:other-user");
+    await api.setMode("connected");
+    expect((await api.health()).loadedAt).toBeUndefined();
+    expect(persistence.storage.read).toHaveBeenCalledWith("tenant:other-user");
+    expect(persistence.authorize).not.toHaveBeenCalled();
+  });
+
+  it("purges previously cached data after a denied authorization", async () => {
+    const { api, entries, persistence } = cache({ revision: "", data: tenant });
+    persistence.authorize.mockRejectedValue(new CacheAccessDenied("Access revoked."));
+    await api.setMode("connected");
+    expect(await api.health()).toMatchObject({ cacheMessage: "Access revoked." });
+    expect((await api.health()).loadedAt).toBeUndefined();
+    expect(entries.get("tenant:user")?.data).toBeUndefined();
+    expect(persistence.notifyPurge).toHaveBeenCalledWith("tenant:user");
+  });
+
+  it("locks a restored snapshot when revalidation fails and keeps it on disk after a transient error", async () => {
+    const { api, entries, persistence } = cache({ revision: "", data: tenant });
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    await api.setMode("connected");
+    expect((await api.health()).loadedAt).toBe(tenant.loadedAt);
+    clock.mockReturnValue(6 * 60_000);
+    persistence.authorize.mockRejectedValue(new Error("Graph unavailable."));
+    expect((await api.health()).loadedAt).toBeUndefined();
+    expect(entries.get("tenant:user")?.data).toEqual(tenant);
+    expect(persistence.notifyPurge).not.toHaveBeenCalled();
+  });
+
+  it("keeps the previous complete snapshot after a group refresh failure", async () => {
+    const { api, entries, persistence } = cache({ revision: "", data: tenant });
+    vi.stubGlobal("fetch", async (url: string) => ({
+      ok: !url.includes("groupTypes"),
+      status: url.includes("groupTypes") ? 400 : 200,
+      json: async () => ({ value: [] }),
+      text: async () => "Group query failed",
+    }));
+    await api.setMode("connected");
+    expect((await api.health()).loadedAt).toBe(tenant.loadedAt);
+    await expect(api.refresh()).rejects.toThrow("last complete tenant snapshot was kept");
+    expect((await api.health()).loadedAt).toBe(tenant.loadedAt);
+    expect(entries.get("tenant:user")?.data).toEqual(tenant);
+    expect(persistence.storage.write).not.toHaveBeenCalled();
+  });
+
+  it("cannot restore the cache after it was cleared during authorization", async () => {
+    const { api, persistence } = cache({ revision: "", data: tenant });
+    persistence.authorize.mockImplementation(async () => {
+      await persistence.storage.clear("tenant:user");
+      return true;
+    });
+    await api.setMode("connected");
+    expect((await api.health()).loadedAt).toBeUndefined();
+  });
+
+  it("does not display or persist a refresh that overlapped a cache clear", async () => {
+    const { api, entries, persistence } = cache();
+    vi.stubGlobal("fetch", async () => ({ ok: true, status: 200, json: async () => ({ value: [] }) }));
+    persistence.authorize.mockImplementation(async () => {
+      await persistence.storage.clear("tenant:user");
+      return true;
+    });
+    await api.setMode("connected");
+    await expect(api.refresh()).rejects.toThrow("The local cache was cleared during the refresh.");
+    expect(entries.get("tenant:user")?.data).toBeUndefined();
+    expect((await api.health()).loadedAt).toBeUndefined();
+  });
+
+  it("does not expose a previous account's in-memory snapshot after the account changes", async () => {
+    const { api, persistence } = cache({ revision: "", data: tenant });
+    await api.setMode("connected");
+    expect((await api.health()).loadedAt).toBe(tenant.loadedAt);
+    persistence.key.mockReturnValue("tenant:other-user");
+    expect((await api.health()).loadedAt).toBeUndefined();
   });
 });
 

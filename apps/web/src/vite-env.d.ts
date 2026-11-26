@@ -11,6 +11,8 @@ interface ImportMetaEnv {
   readonly VITE_STATIC_DEMO?: string;
   /** `live` builds the delegated-auth browser app: MSAL sign-in, Graph read, no backend. */
   readonly VITE_MODE?: string;
+  /** `1` enables the browser-only persistent tenant cache. */
+  readonly VITE_PERSIST_TENANT_CACHE?: string;
   /**
    * Overrides the redirect URI the live build sends to Entra. Only needed when
    * the deployed URL is not `origin + BASE_URL` -- a reverse proxy, or a path

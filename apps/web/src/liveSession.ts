@@ -9,10 +9,60 @@
  * auth awaits `ensureReady()`, which is idempotent.
  */
 
-import { acquireGraphToken, currentAccount, endSession, initAuth, signIn } from "./auth.ts";
-import { forgetLiveMode, rememberConnectedMode } from "./liveApi.ts";
+import { acquireGraphToken, authorizeTenantCache, currentAccount, endSession, initAuth, signIn } from "./auth.ts";
+import { forgetLiveMode, rememberConnectedMode, type PersistentTenantCache } from "./liveApi.ts";
 import { type LiveConfig, readLiveConfig, resolveLiveConfig, saveLiveConfig } from "./liveConfig.ts";
 import { clearSession, readSession, removeSession, writeSession } from "./storage.ts";
+import { tenantCache } from "./tenantCache.ts";
+
+export const PERSIST_TENANT_CACHE = import.meta.env.VITE_PERSIST_TENANT_CACHE === "1";
+
+function cacheKey(): string | null {
+  const account = currentAccount();
+  const clientId = getLiveConfig()?.clientId;
+  if (!account?.tenantId || !account.localAccountId || !clientId || !cacheChannel) return null;
+  return JSON.stringify([account.tenantId.toLowerCase(), account.localAccountId.toLowerCase(), clientId.toLowerCase()]);
+}
+
+let cacheChannel: BroadcastChannel | undefined;
+
+function setupCacheChannel() {
+  if (!PERSIST_TENANT_CACHE || cacheChannel || typeof BroadcastChannel === "undefined") return;
+  cacheChannel = new BroadcastChannel("intune-preflight-tenant-cache");
+  cacheChannel.onmessage = ({ data }: MessageEvent<{ key?: string; end?: boolean }>) => {
+    if (!data?.key || data.key !== cacheKey()) return;
+    if (data.end) {
+      forgetLiveMode();
+      void endSession()
+        .catch(() => {})
+        .finally(() => window.location.reload());
+    } else {
+      window.location.reload();
+    }
+  };
+}
+
+export const liveCachePersistence: PersistentTenantCache = {
+  storage: tenantCache,
+  key: cacheKey,
+  authorize: authorizeTenantCache,
+  notifyPurge: (key) => cacheChannel?.postMessage({ key }),
+};
+
+async function purgeCache(key: string, end: boolean): Promise<void> {
+  try {
+    await tenantCache.clear(key);
+  } finally {
+    cacheChannel?.postMessage({ key, end });
+  }
+}
+
+export async function clearLocalTenantCache(): Promise<void> {
+  const key = PERSIST_TENANT_CACHE ? cacheKey() : null;
+  if (!key) throw new Error("Local tenant storage is unavailable in this browser.");
+  await purgeCache(key, false);
+  window.location.reload();
+}
 
 // Resolved once per page load: `resolveLiveConfig` persists whatever the query
 // string supplied, and re-running it on every caller would mean re-writing
@@ -75,6 +125,7 @@ export function ensureReady(): Promise<void> {
       // unconfigured live build behave exactly like the public demo.
       if (!cfg) return;
       await initAuth(cfg);
+      setupCacheChannel();
     })();
   }
   return readying;
@@ -154,8 +205,14 @@ export function signedInIdentity(): LiveSessionIdentity | null {
  * admin would otherwise have to retype it to sign in again.
  */
 export async function endLiveSession(): Promise<void> {
+  const key = PERSIST_TENANT_CACHE ? cacheKey() : null;
   forgetLiveMode();
-  await endSession();
+  const results = await Promise.allSettled([endSession(), key ? purgeCache(key, true) : undefined]);
+  if (results.some((result) => result.status === "rejected")) {
+    window.alert(
+      "The browser could not finish clearing this session. Clear this site's data in your browser settings."
+    );
+  }
   window.location.reload();
 }
 
