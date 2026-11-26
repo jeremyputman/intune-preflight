@@ -100,10 +100,8 @@ export async function signIn(): Promise<void> {
 let cachedToken: { token: string; expiresAt: number } | null = null;
 let inFlight: Promise<string> | null = null;
 
-const INTUNE_ADMINISTRATOR = "3a2c62db-5318-420d-8d74-23affee5d9d5";
-
-/** Prove current tenant-wide access before restoring an older snapshot. */
-export async function authorizeTenantCache(hasApps: boolean): Promise<boolean> {
+/** Renew this account's delegated token before checking the cached reads. */
+export async function renewTenantCacheToken(): Promise<string> {
   const selected = account;
   if (!selected) throw new CacheAccessDenied("Sign in to verify access to the local tenant cache.");
 
@@ -123,45 +121,7 @@ export async function authorizeTenantCache(hasApps: boolean): Promise<boolean> {
     throw new CacheAccessDenied("The signed-in account changed.");
   }
 
-  // Intune RBAC scope tags can change which objects a successful collection
-  // request returns. Require the tenant-wide Intune Administrator role in a
-  // fresh ID token issued for this app, in addition to the delegated API checks.
-  const claims = result.idTokenClaims as { iat?: unknown; wids?: unknown } | undefined;
-  const issuedAt = claims?.iat;
-  if (
-    result.fromCache ||
-    typeof issuedAt !== "number" ||
-    Math.abs(Date.now() / 1000 - issuedAt) > 120 ||
-    !Array.isArray(claims?.wids) ||
-    !claims.wids.includes(INTUNE_ADMINISTRATOR)
-  ) {
-    return false;
-  }
-
-  const probes = [
-    "/v1.0/groups",
-    "/v1.0/deviceManagement/deviceConfigurations",
-    "/v1.0/deviceManagement/windowsAutopilotDeploymentProfiles",
-    "/beta/deviceManagement/deviceManagementScripts",
-  ];
-  if (hasApps) probes.push("/v1.0/deviceAppManagement/mobileApps");
-
-  const responses = await Promise.allSettled(
-    probes.map((path) =>
-      fetch(`https://graph.microsoft.com${path}?$top=1&$select=id`, {
-        headers: { Authorization: `Bearer ${result.accessToken}` },
-        signal: AbortSignal.timeout(10_000),
-        cache: "no-store",
-      })
-    )
-  );
-  if (responses.some((response) => response.status === "fulfilled" && [401, 403].includes(response.value.status))) {
-    throw new CacheAccessDenied("Microsoft Graph denied access to the local tenant cache.");
-  }
-  if (responses.some((response) => response.status === "rejected" || !response.value.ok)) {
-    throw new Error("Microsoft Graph could not verify access to the local tenant cache.");
-  }
-  return true;
+  return result.accessToken;
 }
 
 export async function acquireGraphToken(): Promise<string> {

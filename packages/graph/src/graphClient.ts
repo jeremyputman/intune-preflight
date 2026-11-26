@@ -134,6 +134,8 @@ export interface GraphClientOptions {
   maxAttempts?: number;
   /** Default parallelism for `mapWithConcurrency` callers. */
   concurrency?: number;
+  /** HTTP cache policy for reads that verify current delegated access. */
+  requestCache?: RequestCache;
 }
 
 export interface GraphClient {
@@ -164,6 +166,7 @@ export function createGraphClient({
   timeoutMs = REQUEST_TIMEOUT_MS,
   maxAttempts = MAX_ATTEMPTS,
   concurrency = DEFAULT_CONCURRENCY,
+  requestCache,
 }: GraphClientOptions): GraphClient {
   let stats: GraphStats = emptyStats();
 
@@ -182,6 +185,7 @@ export function createGraphClient({
       stats.requests++;
       try {
         res = await fetch(url, {
+          ...(requestCache ? { cache: requestCache } : {}),
           method: init?.method ?? "GET",
           body: init?.body,
           signal: controller.signal,

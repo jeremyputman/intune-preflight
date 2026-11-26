@@ -9,7 +9,7 @@
  * auth awaits `ensureReady()`, which is idempotent.
  */
 
-import { acquireGraphToken, authorizeTenantCache, currentAccount, endSession, initAuth, signIn } from "./auth.ts";
+import { acquireGraphToken, currentAccount, endSession, initAuth, renewTenantCacheToken, signIn } from "./auth.ts";
 import { forgetLiveMode, rememberConnectedMode, type PersistentTenantCache } from "./liveApi.ts";
 import { type LiveConfig, readLiveConfig, resolveLiveConfig, saveLiveConfig } from "./liveConfig.ts";
 import { clearSession, readSession, removeSession, writeSession } from "./storage.ts";
@@ -29,7 +29,7 @@ let cacheChannel: BroadcastChannel | undefined;
 function setupCacheChannel() {
   if (!PERSIST_TENANT_CACHE || cacheChannel || typeof BroadcastChannel === "undefined") return;
   cacheChannel = new BroadcastChannel("intune-preflight-tenant-cache");
-  cacheChannel.onmessage = ({ data }: MessageEvent<{ key?: string; end?: boolean }>) => {
+  cacheChannel.onmessage = ({ data }: MessageEvent<{ key?: string; end?: boolean; clear?: boolean }>) => {
     if (!data?.key || data.key !== cacheKey()) return;
     if (data.end) {
       forgetLiveMode();
@@ -37,6 +37,7 @@ function setupCacheChannel() {
         .catch(() => {})
         .finally(() => window.location.reload());
     } else {
+      if (data.clear) forgetLiveMode();
       window.location.reload();
     }
   };
@@ -45,7 +46,7 @@ function setupCacheChannel() {
 export const liveCachePersistence: PersistentTenantCache = {
   storage: tenantCache,
   key: cacheKey,
-  authorize: authorizeTenantCache,
+  renewToken: renewTenantCacheToken,
   notifyPurge: (key) => cacheChannel?.postMessage({ key }),
 };
 
@@ -53,7 +54,7 @@ async function purgeCache(key: string, end: boolean): Promise<void> {
   try {
     await tenantCache.clear(key);
   } finally {
-    cacheChannel?.postMessage({ key, end });
+    cacheChannel?.postMessage({ key, end, clear: !end });
   }
 }
 
@@ -61,6 +62,7 @@ export async function clearLocalTenantCache(): Promise<void> {
   const key = PERSIST_TENANT_CACHE ? cacheKey() : null;
   if (!key) throw new Error("Local tenant storage is unavailable in this browser.");
   await purgeCache(key, false);
+  forgetLiveMode();
   window.location.reload();
 }
 

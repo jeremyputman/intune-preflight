@@ -201,21 +201,21 @@ Enable the local snapshot cache explicitly in a reviewed browser build:
 VITE_PERSIST_TENANT_CACHE=1 PREFLIGHT_LIVE_BASE=/ npm run build:live
 ```
 
-Use the same base path and redirect settings as your existing deployment. To verify eligibility, the
-app needs the Entra app registration to emit tenant-wide directory roles in the ID token
-(`wids`). For a dedicated registration that does not already emit the claim, see
-[Microsoft's directory role claims guidance](https://learn.microsoft.com/en-us/entra/identity/hybrid/connect/how-to-connect-fed-group-claims).
-Review any manifest change with the registration owner. This feature uses existing delegated Graph
-permissions and only persists snapshots for existing Intune Administrators whose role and Graph
-access can be verified. Accounts using scoped Intune roles can still load tenant data for the tab.
+Use the same base path and redirect settings as your existing deployment. The app uses the
+signed-in user's existing delegated Graph permissions, including access granted through custom
+Intune roles. The cache stores only the tenant data available to that account.
 
-Choose **Refresh from Intune** to load the first snapshot. A later sign-in can reuse it after an
-online authorization check. The snapshot retains the original load time. Failed or incomplete
-refreshes preserve an existing complete snapshot while authorization is still valid. Device
-lookups remain live.
+Connected mode automatically loads data if it has no saved snapshot. When reopening a saved
+snapshot, the app renews the user's delegated token and checks the Graph responses that produced
+it. A successful response can still contain fewer objects after an Intune scope change, so the
+check compares the response contents. Graph requests are still required on reopen. If the
+responses match, the app reuses the saved snapshot and preserves its original load time. If
+they differ, it rebuilds the snapshot using the current responses, reusing checks already made
+during that load. Device lookups remain live.
 
-Use **Clear local cache** in the session menu to delete the active snapshot. **End session** also
-deletes it and ends matching sessions in other open tabs. Closing a tab alone retains the snapshot.
+Use **Clear local cache** in the session menu to delete the active snapshot and return to Demo.
+**End session** also deletes it and ends matching sessions in other open tabs. Closing a tab alone
+retains the snapshot.
 Use a dedicated managed browser profile and test sign-out, a second account, permission revocation,
 and offline behavior before enabling the feature on a production site. IndexedDB is local to the
 browser profile and origin. Browser settings can clear all the site's data.

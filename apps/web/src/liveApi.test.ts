@@ -106,34 +106,33 @@ describe("setMode", () => {
 });
 
 describe("persistent tenant snapshots", () => {
-  const tenant = {
-    policies: [],
-    groups: [],
-    autopilotProfiles: [],
-    assignmentFilters: [],
-    loadedAt: "2026-11-25T00:00:00.000Z",
-  };
-
-  function cache(initial?: CacheEntry) {
+  function cache() {
     const entries = new Map<string, CacheEntry>();
-    if (initial) entries.set("tenant:user", initial);
+    let nextRevision = 0;
     const persistence = {
       key: vi.fn(() => "tenant:user"),
-      authorize: vi.fn<PersistentTenantCache["authorize"]>(async () => true),
+      renewToken: vi.fn<PersistentTenantCache["renewToken"]>(async () => "renewed delegated token"),
       notifyPurge: vi.fn(),
       storage: {
         read: vi.fn(async (key: string) => entries.get(key) ?? { revision: "" }),
-        write: vi.fn<PersistentTenantCache["storage"]["write"]>(async (key, revision, data) => {
+        write: vi.fn<PersistentTenantCache["storage"]["write"]>(async (key, revision, data, reads) => {
           if ((entries.get(key)?.revision ?? "") !== revision) return false;
-          entries.set(key, { revision, data });
+          entries.set(key, { revision: String(++nextRevision), data, reads });
           return true;
         }),
-        clear: vi.fn(async (key: string) => {
-          entries.set(key, { revision: "cleared" });
+        clear: vi.fn<PersistentTenantCache["storage"]["clear"]>(async (key, expected) => {
+          if (expected !== undefined && (entries.get(key)?.revision ?? "") !== expected) return undefined;
+          const revision = String(++nextRevision);
+          entries.set(key, { revision });
+          return revision;
         }),
       },
     } satisfies PersistentTenantCache;
     return { entries, persistence, api: createLiveApi(deps({ persistence })) };
+  }
+
+  function graphResponse(value: unknown[] = [], status = 200) {
+    return { ok: status === 200, status, json: async () => ({ value }), text: async () => "Graph response" };
   }
 
   afterEach(() => {
@@ -141,88 +140,108 @@ describe("persistent tenant snapshots", () => {
     vi.restoreAllMocks();
   });
 
-  it("requires a manual first download and reuses it after reopening", async () => {
-    const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ value: [] }) }));
+  it("loads automatically, shares concurrent requests, and reopens an authorized snapshot", async () => {
+    const fetchMock = vi.fn(async (_url: string, _init: RequestInit) => graphResponse());
     vi.stubGlobal("fetch", fetchMock);
-    const { api, persistence } = cache();
+    const { api, persistence, entries } = cache();
     await api.setMode("connected");
-    expect((await api.health()).loadedAt).toBeUndefined();
-    expect(fetchMock).not.toHaveBeenCalled();
-    const { loadedAt } = await api.refresh();
+    const [{ loadedAt }] = await Promise.all([api.health(), api.groups(), api.filters(), api.refresh()]);
     expect(loadedAt).toBeDefined();
     expect(persistence.storage.write).toHaveBeenCalledTimes(1);
+    expect(persistence.renewToken).not.toHaveBeenCalled();
+    const initialCalls = fetchMock.mock.calls.length;
 
     fetchMock.mockClear();
     const reopened = createLiveApi(deps({ persistence }));
     await reopened.setMode("connected");
     expect((await reopened.health()).loadedAt).toBe(loadedAt);
-    expect(persistence.authorize).toHaveBeenLastCalledWith(true);
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(persistence.renewToken).toHaveBeenCalledTimes(1);
+    expect(persistence.storage.write).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls).toHaveLength(entries.get("tenant:user")?.reads?.length ?? 0);
+    expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(initialCalls);
+    expect(fetchMock.mock.calls[0][1].headers).toMatchObject({ Authorization: "Bearer renewed delegated token" });
+    expect(fetchMock.mock.calls[0][1].cache).toBe("no-store");
   });
 
-  it("isolates a different signed-in account from the stored snapshot", async () => {
-    const { api, persistence } = cache({ revision: "", data: tenant });
-    persistence.key.mockReturnValue("tenant:other-user");
+  it("automatically downloads an isolated snapshot for a different signed-in user", async () => {
+    vi.stubGlobal("fetch", async () => graphResponse());
+    const { api, entries, persistence } = cache();
     await api.setMode("connected");
-    expect((await api.health()).loadedAt).toBeUndefined();
+    await api.health();
+    persistence.key.mockReturnValue("tenant:other-user");
+    expect((await api.health()).loadedAt).toBeDefined();
     expect(persistence.storage.read).toHaveBeenCalledWith("tenant:other-user");
-    expect(persistence.authorize).not.toHaveBeenCalled();
+    expect(persistence.renewToken).not.toHaveBeenCalled();
+    expect([...entries.keys()]).toEqual(["tenant:user", "tenant:other-user"]);
   });
 
   it("purges previously cached data after a denied authorization", async () => {
-    const { api, entries, persistence } = cache({ revision: "", data: tenant });
-    persistence.authorize.mockRejectedValue(new CacheAccessDenied("Access revoked."));
+    vi.stubGlobal("fetch", async () => graphResponse());
+    const { api, entries, persistence } = cache();
     await api.setMode("connected");
-    expect(await api.health()).toMatchObject({ cacheMessage: "Access revoked." });
-    expect((await api.health()).loadedAt).toBeUndefined();
+    await api.health();
+    const reopened = createLiveApi(deps({ persistence }));
+    persistence.renewToken.mockRejectedValue(new CacheAccessDenied("Access revoked."));
+    await reopened.setMode("connected");
+    expect(await reopened.health()).toMatchObject({ cacheMessage: "Access revoked." });
+    expect((await reopened.health()).loadedAt).toBeUndefined();
     expect(entries.get("tenant:user")?.data).toBeUndefined();
     expect(persistence.notifyPurge).toHaveBeenCalledWith("tenant:user");
   });
 
   it("locks a restored snapshot when revalidation fails and keeps it on disk after a transient error", async () => {
-    const { api, entries, persistence } = cache({ revision: "", data: tenant });
+    vi.stubGlobal("fetch", async () => graphResponse());
+    const { api, entries, persistence } = cache();
     const clock = vi.spyOn(Date, "now").mockReturnValue(0);
     await api.setMode("connected");
-    expect((await api.health()).loadedAt).toBe(tenant.loadedAt);
-    clock.mockReturnValue(6 * 60_000);
-    persistence.authorize.mockRejectedValue(new Error("Graph unavailable."));
+    const { loadedAt } = await api.health();
+    expect(loadedAt).toBeDefined();
+    clock.mockReturnValue(16 * 60_000);
+    persistence.renewToken.mockRejectedValue(new Error("Graph unavailable."));
     expect((await api.health()).loadedAt).toBeUndefined();
-    expect(entries.get("tenant:user")?.data).toEqual(tenant);
+    expect(entries.get("tenant:user")?.data?.loadedAt).toEqual(loadedAt);
     expect(persistence.notifyPurge).not.toHaveBeenCalled();
   });
 
   it("keeps the previous complete snapshot after a group refresh failure", async () => {
-    const { api, entries, persistence } = cache({ revision: "", data: tenant });
-    vi.stubGlobal("fetch", async (url: string) => ({
-      ok: !url.includes("groupTypes"),
-      status: url.includes("groupTypes") ? 400 : 200,
-      json: async () => ({ value: [] }),
-      text: async () => "Group query failed",
-    }));
+    let unavailable = false;
+    const { api, entries, persistence } = cache();
+    vi.stubGlobal("fetch", async (url: string) => {
+      if (unavailable && url.includes("groupTypes")) throw new Error("Group query failed");
+      return graphResponse();
+    });
     await api.setMode("connected");
-    expect((await api.health()).loadedAt).toBe(tenant.loadedAt);
-    await expect(api.refresh()).rejects.toThrow("last complete tenant snapshot was kept");
-    expect((await api.health()).loadedAt).toBe(tenant.loadedAt);
-    expect(entries.get("tenant:user")?.data).toEqual(tenant);
-    expect(persistence.storage.write).not.toHaveBeenCalled();
+    const { loadedAt } = await api.health();
+    unavailable = true;
+    await expect(api.refresh()).rejects.toThrow("last saved tenant snapshot was kept");
+    expect((await api.health()).loadedAt).toBe(loadedAt);
+    expect(entries.get("tenant:user")?.data?.loadedAt).toBe(loadedAt);
+    expect(persistence.storage.write).toHaveBeenCalledTimes(1);
   });
 
   it("cannot restore the cache after it was cleared during authorization", async () => {
-    const { api, persistence } = cache({ revision: "", data: tenant });
-    persistence.authorize.mockImplementation(async () => {
-      await persistence.storage.clear("tenant:user");
-      return true;
-    });
+    vi.stubGlobal("fetch", async () => graphResponse());
+    const { api, persistence } = cache();
     await api.setMode("connected");
-    expect((await api.health()).loadedAt).toBeUndefined();
+    await api.health();
+    persistence.renewToken.mockImplementation(async () => {
+      await persistence.storage.clear("tenant:user");
+      return "renewed token";
+    });
+    const reopened = createLiveApi(deps({ persistence }));
+    await reopened.setMode("connected");
+    expect((await reopened.health()).loadedAt).toBeUndefined();
   });
 
   it("does not display or persist a refresh that overlapped a cache clear", async () => {
     const { api, entries, persistence } = cache();
-    vi.stubGlobal("fetch", async () => ({ ok: true, status: 200, json: async () => ({ value: [] }) }));
-    persistence.authorize.mockImplementation(async () => {
-      await persistence.storage.clear("tenant:user");
-      return true;
+    let cleared = false;
+    vi.stubGlobal("fetch", async () => {
+      if (!cleared) {
+        cleared = true;
+        await persistence.storage.clear("tenant:user");
+      }
+      return graphResponse();
     });
     await api.setMode("connected");
     await expect(api.refresh()).rejects.toThrow("The local cache was cleared during the refresh.");
@@ -230,12 +249,33 @@ describe("persistent tenant snapshots", () => {
     expect((await api.health()).loadedAt).toBeUndefined();
   });
 
-  it("does not expose a previous account's in-memory snapshot after the account changes", async () => {
-    const { api, persistence } = cache({ revision: "", data: tenant });
+  it("saves a scoped account's available data and replaces it when access shrinks", async () => {
+    const { api, entries, persistence } = cache();
+    const policy = (id: string) => ({
+      id,
+      displayName: id,
+      "@odata.type": "#microsoft.graph.windows10GeneralConfiguration",
+    });
+    let visible = [policy("scope-a"), policy("scope-b")];
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes("/deviceManagement/deviceConfigurations?")) return graphResponse(visible);
+      if (url.includes("/deviceManagement/deviceCompliancePolicies?")) return graphResponse([], 403);
+      return graphResponse();
+    });
+    vi.stubGlobal("fetch", fetchMock);
     await api.setMode("connected");
-    expect((await api.health()).loadedAt).toBe(tenant.loadedAt);
-    persistence.key.mockReturnValue("tenant:other-user");
-    expect((await api.health()).loadedAt).toBeUndefined();
+    expect((await api.health()).loadedAt).toBeDefined();
+    expect(entries.get("tenant:user")?.data?.policies.map(({ id }) => id)).toEqual(["scope-a", "scope-b"]);
+    expect(entries.get("tenant:user")?.reads?.some((read) => read.fingerprint === "403")).toBe(true);
+
+    fetchMock.mockClear();
+    visible = [policy("scope-a")];
+    const reopened = createLiveApi(deps({ persistence }));
+    await reopened.setMode("connected");
+    expect((await reopened.health()).loadedAt).toBeDefined();
+    expect(entries.get("tenant:user")?.data?.policies.map(({ id }) => id)).toEqual(["scope-a"]);
+    expect(persistence.notifyPurge).toHaveBeenCalledWith("tenant:user");
+    expect(fetchMock.mock.calls.filter(([url]) => url.includes("deviceConfigurations?"))).toHaveLength(1);
   });
 });
 

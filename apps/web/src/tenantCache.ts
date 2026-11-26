@@ -1,25 +1,36 @@
 import type { TenantData } from "@intune-preflight/engine";
 
 const DATABASE = "intune-preflight";
-const VERSION = 1;
+const VERSION = 2;
 const STORE = "tenant-snapshots";
 
 export interface CacheEntry {
   revision: string;
   data?: TenantData;
+  reads?: SnapshotRead[];
+}
+
+export interface SnapshotRead {
+  path: string;
+  beta: boolean;
+  collection: boolean;
+  fingerprint: string;
 }
 
 export interface TenantCache {
   read(key: string): Promise<CacheEntry>;
-  write(key: string, revision: string, data: TenantData): Promise<boolean>;
-  clear(key: string): Promise<void>;
+  write(key: string, revision: string, data: TenantData, reads: SnapshotRead[]): Promise<boolean>;
+  clear(key: string, expectedRevision?: string): Promise<string | undefined>;
 }
 
 function openCache(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DATABASE, VERSION);
     let blocked = false;
-    request.onupgradeneeded = () => request.result.createObjectStore(STORE);
+    request.onupgradeneeded = ({ oldVersion }) => {
+      if (oldVersion === 0) request.result.createObjectStore(STORE);
+      else request.transaction?.objectStore(STORE).clear();
+    };
     request.onerror = () => reject(request.error);
     request.onblocked = () => {
       blocked = true;
@@ -67,14 +78,24 @@ export const tenantCache: TenantCache = {
           !Array.isArray(data.policies) ||
           !Array.isArray(data.groups) ||
           !Array.isArray(data.autopilotProfiles) ||
-          !Array.isArray(data.assignmentFilters)
+          !Array.isArray(data.assignmentFilters) ||
+          !Array.isArray(entry.reads) ||
+          !entry.reads.length ||
+          !entry.reads.every(
+            (read) =>
+              typeof read?.path === "string" &&
+              /^\/(?:deviceManagement\/|deviceAppManagement\/|groups[/?])[^#\r\n]*$/.test(read.path) &&
+              typeof read.beta === "boolean" &&
+              typeof read.collection === "boolean" &&
+              /^(?:[\da-f]{64}|400|403|404|405|501)$/.test(read.fingerprint)
+          )
         ) {
           return finish({ revision: entry.revision });
         }
         finish(entry);
       };
     }),
-  write: (key, revision, data) =>
+  write: (key, revision, data, reads) =>
     transact("readwrite", (store, finish) => {
       const request = store.get(key);
       request.onsuccess = () => {
@@ -83,16 +104,25 @@ export const tenantCache: TenantCache = {
           finish(false);
           return;
         }
-        store.put({ revision, data } satisfies CacheEntry, key);
+        store.put({ revision: crypto.randomUUID(), data, reads } satisfies CacheEntry, key);
         finish(true);
       };
     }),
   // A tombstone blocks writes that started before a clear, including from
   // another tab. The transaction removes the previous snapshot in full.
-  clear: (key) =>
+  clear: (key, expectedRevision) =>
     transact("readwrite", (store, finish) => {
-      store.put({ revision: crypto.randomUUID() } satisfies CacheEntry, key);
-      finish(undefined);
+      const request = store.get(key);
+      request.onsuccess = () => {
+        const current: CacheEntry | undefined = request.result;
+        if (expectedRevision !== undefined && (current?.revision ?? "") !== expectedRevision) {
+          finish(undefined);
+          return;
+        }
+        const revision = crypto.randomUUID();
+        store.put({ revision } satisfies CacheEntry, key);
+        finish(revision);
+      };
     }),
 };
 

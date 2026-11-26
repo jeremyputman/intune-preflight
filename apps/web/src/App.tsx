@@ -186,16 +186,19 @@ export default function App() {
       setLoadedAt(status.loadedAt);
       setRefreshKey((k) => k + 1); // remount views so they refetch from the new source
       if (target === "connected") {
-        setTimeout(() => {
-          api
-            .health()
-            .then((s) => {
-              setLoadWarnings(s.loadWarnings ?? []);
-              setLoadedAt(s.loadedAt);
-              setCacheMessage(s.cacheMessage);
-            })
-            .catch(() => {});
-        }, 3000);
+        setTimeout(
+          () => {
+            api
+              .health()
+              .then((s) => {
+                setLoadWarnings(s.loadWarnings ?? []);
+                setLoadedAt(s.loadedAt);
+                setCacheMessage(s.cacheMessage);
+              })
+              .catch(() => {});
+          },
+          LIVE_MODE && PERSIST_TENANT_CACHE ? 0 : 3000
+        );
       }
     } catch (e) {
       setModeError((e as Error).message);
@@ -550,9 +553,9 @@ export default function App() {
           >
             {PERSIST_TENANT_CACHE && demo === false && !loadedAt ? (
               <div className="p-4 text-sm text-slate-300">
-                {refreshing
-                  ? "Reading tenant data from Microsoft Graph."
-                  : "Choose Refresh from Intune to load tenant data."}
+                {cacheMessage && !refreshing
+                  ? "Tenant data is unavailable. Use Refresh from Intune to try again."
+                  : "Loading tenant data from Microsoft Graph."}
               </div>
             ) : (
               <PortalDemoContext.Provider value={demo === true}>{views}</PortalDemoContext.Provider>

@@ -56,6 +56,7 @@ import type { Download } from "./download.ts";
 import { setLoadProgress } from "./loadProgress.ts";
 import { readSession, removeSession, writeSession } from "./storage.ts";
 import { CacheAccessDenied, type CacheEntry, type TenantCache } from "./tenantCache.ts";
+import { createSnapshotReader } from "./snapshotAccess.ts";
 
 /**
  * Graph detail calls in flight at once. Lower than the server's eight: a browser
@@ -83,12 +84,12 @@ const MODE_KEY = "preflight.live.mode";
 
 /** How often the progress counter is republished during a load. */
 const PROGRESS_TICK_MS = 400;
-const CACHE_AUTHORIZATION_MS = 5 * 60_000;
+const CACHE_AUTHORIZATION_MS = 15 * 60_000;
 
 export interface PersistentTenantCache {
   storage: TenantCache;
   key: () => string | null;
-  authorize: (hasApps: boolean) => Promise<boolean>;
+  renewToken: () => Promise<string>;
   notifyPurge: (key: string) => void;
 }
 
@@ -144,13 +145,10 @@ export function createLiveApi(deps: LiveApiDeps) {
   let cacheMessage: string | undefined;
   const persistence = deps.persistence;
 
-  async function purge(key: string) {
-    if (!persistence) return;
-    try {
-      await persistence.storage.clear(key);
-    } finally {
-      persistence.notifyPurge(key);
-    }
+  async function purge(key: string, expectedRevision: string) {
+    const revision = await persistence?.storage.clear(key, expectedRevision);
+    if (revision) persistence?.notifyPurge(key);
+    return revision;
   }
 
   async function readCache(key: string): Promise<CacheEntry | undefined> {
@@ -162,17 +160,91 @@ export function createLiveApi(deps: LiveApiDeps) {
     }
   }
 
-  async function authorizeCache(key: string, hasApps: boolean, hasSnapshot: boolean): Promise<boolean> {
+  async function scopedTenant(
+    key: string,
+    entry: CacheEntry,
+    refresh: boolean,
+    stillCurrent: () => void,
+    setRequestCount: (count: () => number) => void
+  ): Promise<TenantData> {
+    if (!persistence) throw new Error("Browser storage is unavailable.");
+    let { revision, data: previous, reads } = entry;
     try {
-      if (await persistence?.authorize(hasApps)) return true;
+      const token = previous ? await persistence.renewToken() : undefined;
+      stillCurrent();
+      const lookupClient = createGraphClient({
+        getToken: token ? async () => token : deps.getToken,
+        concurrency: BROWSER_CONCURRENCY,
+        requestCache: "no-store",
+      });
+      setRequestCount(() => lookupClient.getGraphStats().requests);
+      const reader = createSnapshotReader(lookupClient);
+      if (previous && reads && !refresh) {
+        if (await reader.matches(reads)) {
+          const current = await readCache(key);
+          stillCurrent();
+          if (!current || current.revision !== revision) {
+            throw new CacheAccessDenied("The local cache changed while it was being checked.");
+          }
+          cachedUntil = Date.now() + CACHE_AUTHORIZATION_MS;
+          cacheMessage = undefined;
+          return previous;
+        }
+        // The old view no longer matches current Graph results. Rebuild from
+        // this account's responses and stop other tabs from using the old data.
+        stillCurrent();
+        const clearedRevision = await purge(key, revision);
+        if (!clearedRevision) throw new CacheAccessDenied("The local cache changed while it was being checked.");
+        revision = clearedRevision;
+        previous = undefined;
+        reads = undefined;
+      }
+
+      const data = await loadTenantData({
+        client: reader.client,
+        mode: "connected",
+        cache: new TtlCache(TAB_LIFETIME_SECONDS),
+        reportGroupFailures: true,
+      });
+      const manifest = await reader.manifest();
+      stillCurrent();
+      if (key !== persistence.key()) throw new CacheAccessDenied("The signed-in account changed.");
+      const cacheable = manifest && (!data.warnings?.length || manifest.some((read) => read.fingerprint === "403"));
+      if (previous && reads) {
+        if (await reader.observedChanges(reads)) {
+          stillCurrent();
+          const currentRevision = await purge(key, revision);
+          if (!currentRevision) throw new CacheAccessDenied("The local cache changed during the refresh.");
+          revision = currentRevision;
+          previous = undefined;
+          if (!cacheable) {
+            throw new CacheAccessDenied("Graph access or data changed. Refresh to load the current tenant data.");
+          }
+        } else if (!cacheable) {
+          throw new Error("The refresh was incomplete. The last saved tenant snapshot was kept.");
+        }
+      }
+      stillCurrent();
+      cachedUntil = undefined;
+      if (cacheable) {
+        try {
+          if (!(await persistence.storage.write(key, revision, data, manifest))) {
+            throw new CacheAccessDenied("The local cache was cleared during the refresh.");
+          }
+          cacheMessage = undefined;
+          cachedUntil = Date.now() + CACHE_AUTHORIZATION_MS;
+        } catch (error) {
+          if (error instanceof CacheAccessDenied) throw error;
+          cacheMessage = "The browser could not save the tenant snapshot. The data is available in this tab.";
+        }
+      } else {
+        cacheMessage = "This load could not be saved. The available tenant data is shown for this tab.";
+      }
+      return data;
     } catch (error) {
-      if (!(error instanceof CacheAccessDenied)) throw error;
-      if (hasSnapshot) await purge(key);
+      if (previous && error instanceof CacheAccessDenied) await purge(key, revision);
       throw error;
     }
-    if (hasSnapshot) await purge(key);
-    cacheMessage = "Local storage requires a verified tenant-wide Intune Administrator role.";
-    return false;
   }
 
   /**
@@ -207,11 +279,12 @@ export function createLiveApi(deps: LiveApiDeps) {
     };
     inFlight = (async () => {
       const active = await ensureMode();
+      let requestCount = () => client.getGraphStats().requests;
       // A demo load is synchronous bundled data -- no counter, no spinner.
       const ticker =
         active === "connected"
           ? setInterval(() => {
-              setLoadProgress({ phase: "loading", requests: client.getGraphStats().requests });
+              if (generation === requestGeneration) setLoadProgress({ phase: "loading", requests: requestCount() });
             }, PROGRESS_TICK_MS)
           : null;
       if (active === "connected") setLoadProgress({ phase: "loading", requests: 0 });
@@ -223,67 +296,24 @@ export function createLiveApi(deps: LiveApiDeps) {
         }
         const entry = key ? await readCache(key) : undefined;
         stillCurrent();
-        let data: TenantData;
-        if (active === "connected" && persistence && !refresh) {
-          if (entry?.data && key && (await authorizeCache(key, entry.data.apps !== undefined, true))) {
-            const current = await readCache(key);
-            data = current?.revision === entry.revision && current.data ? entry.data : EMPTY_TENANT;
-            cachedUntil = data === EMPTY_TENANT ? undefined : Date.now() + CACHE_AUTHORIZATION_MS;
-          } else {
-            data = EMPTY_TENANT;
-          }
-        } else {
-          if (refresh) cache.clear();
-          data = await loadTenantData({
-            client,
-            mode: active,
-            cache,
-            reportGroupFailures: active === "connected" && Boolean(persistence),
-          });
-          stillCurrent();
-          const complete = !data.warnings?.length && data.appsUnavailable?.reason !== "error";
-          const allowed =
-            key && entry && (complete || entry.data)
-              ? await authorizeCache(
-                  key,
-                  data.apps !== undefined || entry.data?.apps !== undefined,
-                  Boolean(entry.data)
-                )
-              : false;
-          stillCurrent();
-          if (active === "connected" && persistence && !complete && (entry?.data ? allowed : loaded?.loadedAt)) {
-            throw new Error("The refresh was incomplete. The last complete tenant snapshot was kept.");
-          }
-          if (key && entry && persistence) {
-            if (complete && allowed) {
-              if (key !== persistence.key()) throw new Error("The signed-in account changed.");
-              try {
-                if (!(await persistence.storage.write(key, entry.revision, data))) {
-                  throw new CacheAccessDenied("The local cache was cleared during the refresh.");
-                }
-                cacheMessage = undefined;
-                cachedUntil = Date.now() + CACHE_AUTHORIZATION_MS;
-              } catch (error) {
-                if (error instanceof CacheAccessDenied) throw error;
-                cacheMessage = "The browser could not save the tenant snapshot. This tab can still use it.";
-                cachedUntil = undefined;
-              }
-            } else {
-              cachedUntil = undefined;
-            }
-          }
-        }
+        if (refresh) cache.clear();
+        const data =
+          key && entry
+            ? await scopedTenant(key, entry, refresh, stillCurrent, (count) => {
+                requestCount = count;
+              })
+            : await loadTenantData({ client, mode: active, cache });
         stillCurrent();
         if (key && key !== persistence?.key()) throw new CacheAccessDenied("The signed-in account changed.");
         loaded = data;
         loadedKey = key;
         warnings = active === "connected" ? (data.warnings ?? []) : [];
-        setLoadProgress({ phase: "ready", requests: client.getGraphStats().requests });
+        setLoadProgress({ phase: "ready", requests: requestCount() });
         return data;
       } catch (err) {
         if (generation !== requestGeneration) throw err;
         if (persistence && (!refresh || err instanceof CacheAccessDenied)) {
-          loaded = refresh ? null : EMPTY_TENANT;
+          loaded = EMPTY_TENANT;
           loadedKey = undefined;
           cachedUntil = undefined;
           warnings = [];
@@ -291,7 +321,7 @@ export function createLiveApi(deps: LiveApiDeps) {
         }
         setLoadProgress({
           phase: "failed",
-          requests: client.getGraphStats().requests,
+          requests: requestCount(),
           error: (err as Error).message,
         });
         throw err;
@@ -402,7 +432,6 @@ export function createLiveApi(deps: LiveApiDeps) {
     refresh: async (): Promise<RefreshResult> => {
       const active = await ensureMode();
       if (!persistence || active === "demo") drop();
-      else if (inFlight) await inFlight.catch(() => {});
       const data = await tenant(true);
       return { warnings, loadedAt: data.loadedAt, ...(cacheMessage ? { cacheMessage } : {}) };
     },
