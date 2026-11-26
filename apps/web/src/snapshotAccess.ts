@@ -94,11 +94,13 @@ export function createSnapshotReader(client: GraphClient) {
       );
       return results.some(Boolean);
     },
-    async manifest(): Promise<SnapshotRead[] | undefined> {
+    async manifest(): Promise<{ reads: SnapshotRead[]; incomplete: boolean }> {
       const results = await Promise.allSettled(used);
       if (authenticationFailed) throw new CacheAccessDenied("Sign in again to load tenant data from Microsoft Graph.");
-      if (!results.length || results.some((result) => result.status === "rejected")) return undefined;
-      return results.flatMap((result) => (result.status === "fulfilled" ? [result.value.read] : []));
+      return {
+        reads: results.flatMap((result) => (result.status === "fulfilled" ? [result.value.read] : [])),
+        incomplete: results.some((result) => result.status === "rejected"),
+      };
     },
   };
 }

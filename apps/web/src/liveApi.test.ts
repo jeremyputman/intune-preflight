@@ -115,10 +115,10 @@ describe("persistent tenant snapshots", () => {
       notifyPurge: vi.fn(),
       storage: {
         read: vi.fn(async (key: string) => entries.get(key) ?? { revision: "" }),
-        write: vi.fn<PersistentTenantCache["storage"]["write"]>(async (key, revision, data, reads) => {
+        write: vi.fn<PersistentTenantCache["storage"]["write"]>(async (key, revision, data, reads, retryIncomplete) => {
           if ((entries.get(key)?.revision ?? "") !== revision) return undefined;
           const savedRevision = String(++nextRevision);
-          entries.set(key, { revision: savedRevision, data, reads });
+          entries.set(key, { revision: savedRevision, data, reads, retryIncomplete });
           return savedRevision;
         }),
         clear: vi.fn<PersistentTenantCache["storage"]["clear"]>(async (key, expected) => {
@@ -196,6 +196,37 @@ describe("persistent tenant snapshots", () => {
     expect((await expired.health()).loadedAt).toBe(loadedAt);
     expect(persistence.renewToken).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalled();
+  });
+
+  it("reuses a partial first load on reload and retries its failed reads after the window expires", async () => {
+    browserTab();
+    let groupsUnavailable = true;
+    const fetchMock = vi.fn(async (url: string) => {
+      if (groupsUnavailable && url.includes("groupTypes")) throw new Error("Group query failed");
+      return graphResponse();
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const { api, persistence, entries } = cache();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    await api.setMode("connected");
+    const { loadedAt } = await api.health();
+    expect(loadedAt).toBeDefined();
+    expect(entries.get("tenant:user")?.retryIncomplete).toBe(true);
+
+    fetchMock.mockClear();
+    const reloaded = createLiveApi(deps({ persistence, isSignedIn: () => true }));
+    expect(await reloaded.health()).toMatchObject({
+      loadedAt,
+      cacheMessage: expect.stringContaining("Some Graph reads failed"),
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    groupsUnavailable = false;
+    clock.mockReturnValue(16 * 60_000);
+    const expired = createLiveApi(deps({ persistence, isSignedIn: () => true }));
+    expect((await expired.health()).cacheMessage).toBeUndefined();
+    expect(fetchMock.mock.calls.some(([url]) => url.includes("groupTypes"))).toBe(true);
+    expect(entries.get("tenant:user")?.retryIncomplete).toBe(false);
   });
 
   it("does not reuse tab authorization for a replacement snapshot or after ending the session", async () => {

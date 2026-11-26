@@ -8,6 +8,7 @@ export interface CacheEntry {
   revision: string;
   data?: TenantData;
   reads?: SnapshotRead[];
+  retryIncomplete?: boolean;
 }
 
 export interface SnapshotRead {
@@ -19,7 +20,13 @@ export interface SnapshotRead {
 
 export interface TenantCache {
   read(key: string): Promise<CacheEntry>;
-  write(key: string, revision: string, data: TenantData, reads: SnapshotRead[]): Promise<string | undefined>;
+  write(
+    key: string,
+    revision: string,
+    data: TenantData,
+    reads: SnapshotRead[],
+    retryIncomplete: boolean
+  ): Promise<string | undefined>;
   clear(key: string, expectedRevision?: string): Promise<string | undefined>;
 }
 
@@ -95,7 +102,7 @@ export const tenantCache: TenantCache = {
         finish(entry);
       };
     }),
-  write: (key, revision, data, reads) =>
+  write: (key, revision, data, reads, retryIncomplete) =>
     transact("readwrite", (store, finish) => {
       const request = store.get(key);
       request.onsuccess = () => {
@@ -105,7 +112,7 @@ export const tenantCache: TenantCache = {
           return;
         }
         const nextRevision = crypto.randomUUID();
-        store.put({ revision: nextRevision, data, reads } satisfies CacheEntry, key);
+        store.put({ revision: nextRevision, data, reads, retryIncomplete } satisfies CacheEntry, key);
         finish(nextRevision);
       };
     }),

@@ -86,6 +86,8 @@ const SNAPSHOT_ACCESS_KEY = "preflight.live.snapshotAccess";
 /** How often the progress counter is republished during a load. */
 const PROGRESS_TICK_MS = 400;
 const CACHE_AUTHORIZATION_MS = 15 * 60_000;
+const INCOMPLETE_SNAPSHOT_NOTICE =
+  "Some Graph reads failed. The available data is saved for reloads in this tab. Use Refresh from Intune to retry.";
 
 function readSnapshotAccess(key: string, revision: string): number | undefined {
   const saved = readSession(SNAPSHOT_ACCESS_KEY);
@@ -201,7 +203,7 @@ export function createLiveApi(deps: LiveApiDeps) {
         const expiresAt = readSnapshotAccess(key, revision);
         if (expiresAt !== undefined) {
           cachedUntil = expiresAt;
-          cacheMessage = undefined;
+          cacheMessage = entry.retryIncomplete ? INCOMPLETE_SNAPSHOT_NOTICE : undefined;
           return previous;
         }
       }
@@ -215,7 +217,7 @@ export function createLiveApi(deps: LiveApiDeps) {
       });
       setRequestCount(() => lookupClient.getGraphStats().requests);
       const reader = createSnapshotReader(lookupClient);
-      if (previous && reads && !refresh) {
+      if (previous && reads && !refresh && !entry.retryIncomplete) {
         if (await reader.matches(reads)) {
           const current = await readCache(key);
           stillCurrent();
@@ -245,7 +247,10 @@ export function createLiveApi(deps: LiveApiDeps) {
       const manifest = await reader.manifest();
       stillCurrent();
       if (key !== persistence.key()) throw new CacheAccessDenied("The signed-in account changed.");
-      const cacheable = manifest && (!data.warnings?.length || manifest.some((read) => read.fingerprint === "403"));
+      const complete =
+        !manifest.incomplete && (!data.warnings?.length || manifest.reads.some((read) => read.fingerprint === "403"));
+      const hasAuthorizedReads = manifest.reads.some((read) => read.fingerprint.length === 64);
+      const keepComplete = previous && !entry.retryIncomplete && !complete;
       if (previous && reads) {
         if (await reader.observedChanges(reads)) {
           stillCurrent();
@@ -253,24 +258,24 @@ export function createLiveApi(deps: LiveApiDeps) {
           if (!currentRevision) throw new CacheAccessDenied("The local cache changed during the refresh.");
           revision = currentRevision;
           previous = undefined;
-          if (!cacheable) {
+          if (keepComplete) {
             throw new CacheAccessDenied("Graph access or data changed. Refresh to load the current tenant data.");
           }
-        } else if (!cacheable) {
+        } else if (keepComplete) {
           throw new Error("The refresh was incomplete. The last saved tenant snapshot was kept.");
         }
       }
       stillCurrent();
       cachedUntil = undefined;
-      if (cacheable) {
+      if (hasAuthorizedReads) {
         try {
-          const savedRevision = await persistence.storage.write(key, revision, data, manifest);
+          const savedRevision = await persistence.storage.write(key, revision, data, manifest.reads, !complete);
           if (!savedRevision) {
             throw new CacheAccessDenied("The local cache was cleared during the refresh.");
           }
           stillCurrent();
           if (key !== persistence.key()) throw new CacheAccessDenied("The signed-in account changed.");
-          cacheMessage = undefined;
+          cacheMessage = complete ? undefined : INCOMPLETE_SNAPSHOT_NOTICE;
           cachedUntil = rememberSnapshotAccess(key, savedRevision);
         } catch (error) {
           if (error instanceof CacheAccessDenied) throw error;

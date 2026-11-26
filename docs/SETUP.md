@@ -208,6 +208,10 @@ Intune roles. The cache stores only the tenant data available to that account.
 Connected mode automatically loads data if it has no saved snapshot. Reloading the page in the
 same signed-in tab reuses the saved data and its original load time for the remainder of the
 15-minute authorization window. Repeated reloads do not extend that window.
+If some Graph reads fail on the first load, the available data can still be
+saved for reloads during that window. The app indicates the incomplete load
+and retries it after the window expires. An incomplete refresh preserves a
+previous complete snapshot while it remains authorized.
 
 A new session, an expired authorization window, or a replaced snapshot requires an online check.
 The app renews the user's delegated token and checks the Graph responses that produced the
