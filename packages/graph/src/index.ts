@@ -29,4 +29,4 @@ export {
 
 export { loadTenantData, type LoadTenantDataOptions, type TenantMode } from "./intuneData.js";
 
-export { readDeviceMembership, searchDevices } from "./devices.js";
+export { readDeviceGroup, readDeviceMembership, searchDevices } from "./devices.js";

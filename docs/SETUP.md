@@ -221,6 +221,14 @@ be verified. The checks establish access to those API areas. Object-level scope 
 within an accessible area are reflected after **Refresh from Intune** reads fresh data.
 Device lookups remain live.
 
+When a live device lookup discovers a group missing from the local catalog, the app saves
+the group's name and any available dynamic rule with the current tenant snapshot. It uses
+the details returned with the live membership list and makes a targeted Graph read for rows
+that contain only a group ID. If Graph still withholds the details, the lookup can show the
+ID without saving a group record. The cache stores group details only. It does not retain
+the device or its list of memberships, change the simulated assignments, or advance the
+tenant refresh time. Clearing or replacing the snapshot clears its discovered groups.
+
 Use **Clear local cache** in the session menu to delete the active snapshot and return to Demo.
 **End session** also deletes it and ends matching sessions in other open tabs. Closing a tab alone
 retains the snapshot.

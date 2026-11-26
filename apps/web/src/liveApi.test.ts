@@ -14,7 +14,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { demoApi } from "./demoApi.ts";
 import { createLiveApi, forgetLiveMode, type LiveApiDeps, type PersistentTenantCache } from "./liveApi.ts";
-import { CacheAccessDenied, type CacheEntry } from "./tenantCache.ts";
+import { CacheAccessDenied, cachedGroupIds, type CacheEntry } from "./tenantCache.ts";
 
 function deps(overrides: Partial<LiveApiDeps> = {}): LiveApiDeps {
   return {
@@ -121,6 +121,18 @@ describe("persistent tenant snapshots", () => {
           entries.set(key, { revision: savedRevision, data, reads, retryIncomplete });
           return savedRevision;
         }),
+        addDiscoveredGroups: vi.fn<PersistentTenantCache["storage"]["addDiscoveredGroups"]>(
+          async (key, revision, groups) => {
+            const current = entries.get(key);
+            if (!current?.data || current.revision !== revision) return;
+            const known = cachedGroupIds(current);
+            const discoveredGroups = [
+              ...(current.discoveredGroups ?? []),
+              ...groups.filter(({ id }) => !known.has(id.toLowerCase())),
+            ];
+            entries.set(key, { ...current, discoveredGroups });
+          }
+        ),
         clear: vi.fn<PersistentTenantCache["storage"]["clear"]>(async (key, expected) => {
           if (expected !== undefined && (entries.get(key)?.revision ?? "") !== expected) return undefined;
           const revision = String(++nextRevision);
@@ -309,6 +321,91 @@ describe("persistent tenant snapshots", () => {
     expect((await reopened.health()).loadedAt).toBeUndefined();
     expect(entries.get("tenant:user")?.data).toBeUndefined();
     expect(persistence.notifyPurge).toHaveBeenCalledWith("tenant:user");
+  });
+
+  it("saves discovered group details alone and resolves ID-only memberships through Graph", async () => {
+    const { api, persistence, entries } = cache();
+    const deviceId = "11111111-1111-1111-1111-111111111111";
+    const knownId = "22222222-2222-2222-2222-222222222222";
+    const newId = "33333333-3333-3333-3333-333333333333";
+    const resolvedId = "44444444-4444-4444-4444-444444444444";
+    const deniedId = "55555555-5555-5555-5555-555555555555";
+    const rule = '(device.deviceOSType -eq "Windows")';
+    const object = (value: object) => ({ ...graphResponse(), json: async () => value });
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url.includes("/transitiveMemberOf/")) {
+        return graphResponse([
+          { id: knownId, displayName: "Already in the tenant snapshot" },
+          { id: newId, displayName: "New static group" },
+          { id: resolvedId, displayName: null },
+          { id: deniedId, displayName: null },
+        ]);
+      }
+      if (url.includes(`/devices/${deviceId}?`)) return object({ id: deviceId, displayName: "Field device" });
+      if (url.includes(`/groups/${resolvedId}?`)) {
+        return object({
+          id: resolvedId,
+          displayName: "Dynamic group",
+          groupTypes: ["DynamicMembership"],
+          membershipRule: rule,
+        });
+      }
+      if (url.includes(`/groups/${deniedId}?`)) return graphResponse([], 403);
+      return graphResponse();
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    await api.setMode("connected");
+    const { loadedAt } = await api.health();
+    const initial = entries.get("tenant:user")!;
+    initial.data?.groups.push({ id: knownId, displayName: "Already in the tenant snapshot" });
+
+    fetchMock.mockClear();
+    const result = await api.deviceMembership(deviceId);
+    expect(result).toMatchObject({
+      membership: {
+        groups: [
+          { id: knownId, displayName: "Already in the tenant snapshot" },
+          { id: newId, displayName: "New static group" },
+          { id: resolvedId, displayName: "Dynamic group", isDynamic: true, membershipRule: rule },
+          { id: deniedId, displayName: deniedId },
+        ],
+      },
+    });
+    const saved = entries.get("tenant:user");
+    expect(saved?.discoveredGroups).toEqual([
+      { id: newId, displayName: "New static group" },
+      { id: resolvedId, displayName: "Dynamic group", isDynamic: true, membershipRule: rule },
+    ]);
+    expect(saved?.revision).toBe(initial.revision);
+    expect(saved?.data?.loadedAt).toBe(loadedAt);
+    expect(JSON.stringify(saved?.discoveredGroups)).not.toContain(deviceId);
+    expect(fetchMock.mock.calls.filter(([url]) => url.includes("/groups/"))).toHaveLength(2);
+
+    await api.deviceMembership(deviceId);
+    expect(persistence.storage.addDiscoveredGroups).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls.filter(([url]) => url.includes("/transitiveMemberOf/"))).toHaveLength(2);
+  });
+
+  it("cannot repopulate discovered group details after another tab clears the snapshot", async () => {
+    const { api, persistence, entries } = cache();
+    const deviceId = "11111111-1111-1111-1111-111111111111";
+    const groupId = "22222222-2222-2222-2222-222222222222";
+    vi.stubGlobal("fetch", async (url: string) => {
+      if (url.includes("/transitiveMemberOf/")) return graphResponse([{ id: groupId }]);
+      if (url.includes(`/devices/${deviceId}?`)) {
+        return { ...graphResponse(), json: async () => ({ id: deviceId, displayName: "Field device" }) };
+      }
+      if (url.includes(`/groups/${groupId}?`)) {
+        await persistence.storage.clear("tenant:user");
+        return { ...graphResponse(), json: async () => ({ id: groupId, displayName: "New group" }) };
+      }
+      return graphResponse();
+    });
+
+    await api.setMode("connected");
+    await api.health();
+    await api.deviceMembership(deviceId);
+    expect(entries.get("tenant:user")?.discoveredGroups).toBeUndefined();
   });
 
   it("purges the snapshot when Graph denies one of the access checks", async () => {

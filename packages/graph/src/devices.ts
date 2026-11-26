@@ -26,6 +26,7 @@ import { platformFromAssignmentFilter } from "@intune-preflight/engine";
 import { type GraphClient, isGraphStatus } from "./graphClient.js";
 
 const DEVICE_FIELDS = "id,displayName,operatingSystem,operatingSystemVersion,trustType";
+const GROUP_FIELDS = "id,displayName,groupTypes,membershipRule";
 /** What the search filters on; read alongside DEVICE_FIELDS, never shown. */
 const MANAGEMENT_FIELDS = "accountEnabled,isManaged,mdmAppId,approximateLastSignInDateTime";
 /** Enough to pick from; a name precise enough to matter is in the first page. */
@@ -178,6 +179,32 @@ async function filtersFor(
   }
 }
 
+function toMembershipGroup(id: string, raw: Record<string, unknown>): DeviceMembership["groups"][number] {
+  return {
+    id,
+    displayName: typeof raw.displayName === "string" && raw.displayName.trim() ? raw.displayName : id,
+    ...(Array.isArray(raw.groupTypes) && raw.groupTypes.includes("DynamicMembership") ? { isDynamic: true } : {}),
+    ...(typeof raw.membershipRule === "string" && raw.membershipRule ? { membershipRule: raw.membershipRule } : {}),
+  };
+}
+
+/** A best-effort read when Graph provided only a membership group ID. */
+export async function readDeviceGroup(
+  client: GraphClient,
+  id: string
+): Promise<DeviceMembership["groups"][number] | undefined> {
+  if (!GUID.test(id)) return undefined;
+  try {
+    const raw = await client.graphGetObject<Record<string, unknown>>(`/groups/${id}?$select=${GROUP_FIELDS}`);
+    if (typeof raw?.id !== "string" || raw.id.toLowerCase() !== id.toLowerCase()) return undefined;
+    const group = toMembershipGroup(id, raw);
+    return group.displayName === id ? undefined : group;
+  } catch {
+    // The device's membership remains valid when the group's details cannot be read.
+    return undefined;
+  }
+}
+
 /** One device's facts and every group it is in, directly or through nesting. */
 export async function readDeviceMembership(client: GraphClient, id: string): Promise<DeviceMembershipResponse> {
   if (!GUID.test(id)) return { unavailable: { reason: "error", detail: "That is not a device id." } };
@@ -186,7 +213,7 @@ export async function readDeviceMembership(client: GraphClient, id: string): Pro
       `/devices/${id}?$select=${DEVICE_FIELDS},physicalIds,enrollmentProfileName`
     );
     const groups = await client.graphGetCollection<Record<string, unknown>>(
-      `/devices/${id}/transitiveMemberOf/microsoft.graph.group?$select=id,displayName,groupTypes,membershipRule`
+      `/devices/${id}/transitiveMemberOf/microsoft.graph.group?$select=${GROUP_FIELDS}`
     );
     const device = toResult(raw);
     const { isAutopilot, groupTag } = readPhysicalIds(raw.physicalIds as string[] | undefined);
@@ -199,17 +226,7 @@ export async function readDeviceMembership(client: GraphClient, id: string): Pro
         isAutopilot,
         ...(groupTag ? { groupTag } : {}),
         ...(raw.enrollmentProfileName ? { enrollmentProfileName: raw.enrollmentProfileName as string } : {}),
-        groups: groups
-          .filter((g) => typeof g.id === "string")
-          .map((g) => {
-            const dynamic = ((g.groupTypes as string[] | undefined) ?? []).includes("DynamicMembership");
-            return {
-              id: g.id as string,
-              displayName: (g.displayName as string) ?? (g.id as string),
-              ...(dynamic ? { isDynamic: true } : {}),
-              ...(g.membershipRule ? { membershipRule: g.membershipRule as string } : {}),
-            };
-          }),
+        groups: groups.filter((g) => typeof g.id === "string").map((g) => toMembershipGroup(g.id as string, g)),
         ...filterResult,
       },
     };
