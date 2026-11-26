@@ -55,6 +55,8 @@ import type {
 import type { Download } from "./download.ts";
 import { setLoadProgress } from "./loadProgress.ts";
 import { readSession, removeSession, writeSession } from "./storage.ts";
+import { CacheAccessDenied, type CacheEntry, type TenantCache } from "./tenantCache.ts";
+import { createSnapshotReader, verifySnapshotAccess } from "./snapshotAccess.ts";
 
 /**
  * Graph detail calls in flight at once. Lower than the server's eight: a browser
@@ -79,9 +81,46 @@ const TAB_LIFETIME_SECONDS = 24 * 60 * 60;
  * scoped like the token itself.
  */
 const MODE_KEY = "preflight.live.mode";
+const SNAPSHOT_ACCESS_KEY = "preflight.live.snapshotAccess";
 
 /** How often the progress counter is republished during a load. */
 const PROGRESS_TICK_MS = 400;
+const CACHE_AUTHORIZATION_MS = 15 * 60_000;
+const INCOMPLETE_SNAPSHOT_NOTICE =
+  "Some Graph reads failed when this snapshot was saved. Use Refresh from Intune to retry.";
+
+function readSnapshotAccess(key: string, revision: string): number | undefined {
+  const saved = readSession(SNAPSHOT_ACCESS_KEY);
+  if (!saved) return;
+  try {
+    const access: { key: string; revision: string; expiresAt: number } | null = JSON.parse(saved);
+    const now = Date.now();
+    if (
+      access?.key === key &&
+      access.revision === revision &&
+      Number.isFinite(access.expiresAt) &&
+      access.expiresAt > now &&
+      access.expiresAt <= now + CACHE_AUTHORIZATION_MS
+    ) {
+      return access.expiresAt;
+    }
+  } catch {
+    // A missing or invalid tab record requires an online check.
+  }
+}
+
+function rememberSnapshotAccess(key: string, revision: string): number {
+  const expiresAt = Date.now() + CACHE_AUTHORIZATION_MS;
+  writeSession(SNAPSHOT_ACCESS_KEY, JSON.stringify({ key, revision, expiresAt }));
+  return expiresAt;
+}
+
+export interface PersistentTenantCache {
+  storage: TenantCache;
+  key: () => string | null;
+  renewToken: () => Promise<string>;
+  notifyPurge: (key: string) => void;
+}
 
 export interface LiveApiDeps {
   /**
@@ -101,6 +140,7 @@ export interface LiveApiDeps {
   isSignedIn: () => boolean;
   /** Whether a tenant ID and client ID are configured -- the live build's `hasCredentials`. */
   isConfigured: () => boolean;
+  persistence?: PersistentTenantCache;
 }
 
 // Stands in for a tenant that has not loaded yet, so the synchronous export-URL
@@ -126,8 +166,123 @@ export function createLiveApi(deps: LiveApiDeps) {
 
   let mode: TenantMode | null = null;
   let loaded: TenantData | null = null;
+  let loadedKey: string | null | undefined;
   let warnings: string[] = [];
   let inFlight: Promise<TenantData> | null = null;
+  let generation = 0;
+  let cachedUntil: number | undefined;
+  let cacheMessage: string | undefined;
+  const persistence = deps.persistence;
+
+  async function purge(key: string, expectedRevision: string) {
+    const revision = await persistence?.storage.clear(key, expectedRevision);
+    if (revision) persistence?.notifyPurge(key);
+    return revision;
+  }
+
+  async function readCache(key: string): Promise<CacheEntry | undefined> {
+    try {
+      return await persistence?.storage.read(key);
+    } catch {
+      cacheMessage = "Browser storage is unavailable. Tenant data can still be loaded for this tab.";
+      return undefined;
+    }
+  }
+
+  async function scopedTenant(
+    key: string,
+    entry: CacheEntry,
+    refresh: boolean,
+    stillCurrent: () => void,
+    setRequestCount: (count: () => number) => void
+  ): Promise<TenantData> {
+    if (!persistence) throw new Error("Browser storage is unavailable.");
+    const { reads } = entry;
+    let { revision, data: previous } = entry;
+    try {
+      if (previous && reads && !refresh) {
+        const expiresAt = readSnapshotAccess(key, revision);
+        if (expiresAt !== undefined) {
+          cachedUntil = expiresAt;
+          cacheMessage = entry.retryIncomplete ? INCOMPLETE_SNAPSHOT_NOTICE : undefined;
+          return previous;
+        }
+      }
+
+      const token = previous ? await persistence.renewToken() : undefined;
+      stillCurrent();
+      const lookupClient = createGraphClient({
+        getToken: token ? async () => token : deps.getToken,
+        concurrency: BROWSER_CONCURRENCY,
+        requestCache: "no-store",
+      });
+      setRequestCount(() => lookupClient.getGraphStats().requests);
+      if (previous && reads && !refresh) {
+        await verifySnapshotAccess(lookupClient, reads);
+        const current = await readCache(key);
+        stillCurrent();
+        if (!current || current.revision !== revision) {
+          throw new CacheAccessDenied("The local cache changed while it was being checked.");
+        }
+        cachedUntil = rememberSnapshotAccess(key, revision);
+        cacheMessage = entry.retryIncomplete ? INCOMPLETE_SNAPSHOT_NOTICE : undefined;
+        return previous;
+      }
+
+      const reader = createSnapshotReader(lookupClient);
+      const data = await loadTenantData({
+        client: reader.client,
+        mode: "connected",
+        cache: new TtlCache(TAB_LIFETIME_SECONDS),
+        reportGroupFailures: true,
+      });
+      const manifest = await reader.manifest();
+      stillCurrent();
+      if (key !== persistence.key()) throw new CacheAccessDenied("The signed-in account changed.");
+      const complete =
+        !manifest.incomplete && (!data.warnings?.length || manifest.reads.some((read) => read.fingerprint === "403"));
+      const hasAuthorizedReads = manifest.reads.some((read) => read.fingerprint.length === 64);
+      const keepComplete = previous && !entry.retryIncomplete && !complete;
+      if (previous && reads) {
+        if (await reader.observedChanges(reads)) {
+          stillCurrent();
+          const currentRevision = await purge(key, revision);
+          if (!currentRevision) throw new CacheAccessDenied("The local cache changed during the refresh.");
+          revision = currentRevision;
+          previous = undefined;
+          if (keepComplete) {
+            throw new CacheAccessDenied("Graph access or data changed. Refresh to load the current tenant data.");
+          }
+        } else if (keepComplete) {
+          throw new Error("The refresh was incomplete. The last saved tenant snapshot was kept.");
+        }
+      }
+      stillCurrent();
+      cachedUntil = undefined;
+      if (hasAuthorizedReads) {
+        try {
+          const savedRevision = await persistence.storage.write(key, revision, data, manifest.reads, !complete);
+          if (!savedRevision) {
+            throw new CacheAccessDenied("The local cache was cleared during the refresh.");
+          }
+          stillCurrent();
+          if (key !== persistence.key()) throw new CacheAccessDenied("The signed-in account changed.");
+          cacheMessage = complete ? undefined : INCOMPLETE_SNAPSHOT_NOTICE;
+          cachedUntil = rememberSnapshotAccess(key, savedRevision);
+        } catch (error) {
+          if (error instanceof CacheAccessDenied) throw error;
+          cacheMessage = "The browser could not save the tenant snapshot. The data is available in this tab.";
+        }
+      } else {
+        cacheMessage = "This load could not be saved. The available tenant data is shown for this tab.";
+      }
+      return data;
+    } catch (error) {
+      if (previous && error instanceof CacheAccessDenied) await purge(key, revision);
+      if (error instanceof CacheAccessDenied) removeSession(SNAPSHOT_ACCESS_KEY);
+      throw error;
+    }
+  }
 
   /**
    * The current mode, resolved on first use because it depends on whether a
@@ -148,36 +303,68 @@ export function createLiveApi(deps: LiveApiDeps) {
    * through here, so the three requests the UI fires on mount share one load
    * rather than starting three.
    */
-  function tenant(): Promise<TenantData> {
-    if (loaded) return Promise.resolve(loaded);
+  function tenant(refresh = false): Promise<TenantData> {
+    if (loadedKey && loadedKey !== persistence?.key()) drop();
+    if (!refresh && loaded && (cachedUntil === undefined || Date.now() < cachedUntil)) {
+      return Promise.resolve(loaded);
+    }
     if (inFlight) return inFlight;
 
+    const requestGeneration = generation;
+    const stillCurrent = () => {
+      if (generation !== requestGeneration) throw new Error("The tenant session changed.");
+    };
     inFlight = (async () => {
       const active = await ensureMode();
+      let requestCount = () => client.getGraphStats().requests;
       // A demo load is synchronous bundled data -- no counter, no spinner.
       const ticker =
         active === "connected"
           ? setInterval(() => {
-              setLoadProgress({ phase: "loading", requests: client.getGraphStats().requests });
+              if (generation === requestGeneration) setLoadProgress({ phase: "loading", requests: requestCount() });
             }, PROGRESS_TICK_MS)
           : null;
       if (active === "connected") setLoadProgress({ phase: "loading", requests: 0 });
       try {
-        const data = await loadTenantData({ client, mode: active, cache });
+        stillCurrent();
+        const key = active === "connected" ? persistence?.key() : null;
+        if (active === "connected" && persistence && !key) {
+          cacheMessage = "Browser storage is unavailable. Tenant data can still be loaded for this tab.";
+        }
+        const entry = key ? await readCache(key) : undefined;
+        stillCurrent();
+        if (refresh) cache.clear();
+        const data =
+          key && entry
+            ? await scopedTenant(key, entry, refresh, stillCurrent, (count) => {
+                requestCount = count;
+              })
+            : await loadTenantData({ client, mode: active, cache });
+        stillCurrent();
+        if (key && key !== persistence?.key()) throw new CacheAccessDenied("The signed-in account changed.");
         loaded = data;
+        loadedKey = key;
         warnings = active === "connected" ? (data.warnings ?? []) : [];
-        setLoadProgress({ phase: "ready", requests: client.getGraphStats().requests });
+        setLoadProgress({ phase: "ready", requests: requestCount() });
         return data;
       } catch (err) {
+        if (generation !== requestGeneration) throw err;
+        if (persistence && (!refresh || err instanceof CacheAccessDenied)) {
+          loaded = EMPTY_TENANT;
+          loadedKey = undefined;
+          cachedUntil = undefined;
+          warnings = [];
+          cacheMessage = (err as Error).message;
+        }
         setLoadProgress({
           phase: "failed",
-          requests: client.getGraphStats().requests,
+          requests: requestCount(),
           error: (err as Error).message,
         });
         throw err;
       } finally {
         if (ticker !== null) clearInterval(ticker);
-        inFlight = null;
+        if (generation === requestGeneration) inFlight = null;
       }
     })();
 
@@ -186,9 +373,14 @@ export function createLiveApi(deps: LiveApiDeps) {
 
   /** Forgets the loaded tenant so the next read fetches it again. */
   function drop() {
+    generation++;
+    inFlight = null;
     cache.clear();
     loaded = null;
+    loadedKey = undefined;
     warnings = [];
+    cachedUntil = undefined;
+    cacheMessage = undefined;
   }
 
   /**
@@ -201,7 +393,12 @@ export function createLiveApi(deps: LiveApiDeps) {
    * loaded report, so in practice the tenant is always here; the empty fallback
    * is so a race can't throw out of a click handler.
    */
-  const tenantNow = () => loaded ?? EMPTY_TENANT;
+  const tenantNow = () =>
+    loaded &&
+    (!loadedKey || loadedKey === persistence?.key()) &&
+    (cachedUntil === undefined || Date.now() < cachedUntil)
+      ? loaded
+      : EMPTY_TENANT;
 
   return {
     health: async (): Promise<ServerStatus> => {
@@ -210,13 +407,15 @@ export function createLiveApi(deps: LiveApiDeps) {
       // incomplete load; a browser load takes longer than that poll, and
       // without this the poll would always report "no warnings".
       const active = await ensureMode();
-      if (inFlight) await inFlight.catch(() => {});
+      if (persistence && active === "connected") await tenant().catch(() => {});
+      else if (inFlight) await inFlight.catch(() => {});
       return {
         status: "ok",
         demo: active === "demo",
         hasCredentials: deps.isConfigured(),
         loadWarnings: warnings,
         loadedAt: active === "connected" ? loaded?.loadedAt : undefined,
+        ...(cacheMessage ? { cacheMessage } : {}),
       };
     },
 
@@ -225,6 +424,7 @@ export function createLiveApi(deps: LiveApiDeps) {
       if (target === "connected") {
         // Remember the intent BEFORE signing in: `ensureSignedIn` may navigate
         // to Entra, and what we want on the way back is Connected.
+        if (!deps.isSignedIn()) removeSession(SNAPSHOT_ACCESS_KEY);
         writeSession(MODE_KEY, "connected");
         setLoadProgress({ phase: "signing-in", requests: 0 });
         try {
@@ -268,9 +468,10 @@ export function createLiveApi(deps: LiveApiDeps) {
     },
 
     refresh: async (): Promise<RefreshResult> => {
-      drop();
-      const data = await tenant();
-      return { warnings, loadedAt: data.loadedAt };
+      const active = await ensureMode();
+      if (!persistence || active === "demo") drop();
+      const data = await tenant(true);
+      return { warnings, loadedAt: data.loadedAt, ...(cacheMessage ? { cacheMessage } : {}) };
     },
 
     simulate: async (inputs: SimulationInputs) => computeSimulation(await tenant(), toInputs(inputs)),
@@ -295,6 +496,7 @@ export function createLiveApi(deps: LiveApiDeps) {
  */
 export function forgetLiveMode(): void {
   removeSession(MODE_KEY);
+  removeSession(SNAPSHOT_ACCESS_KEY);
 }
 
 /**
@@ -303,5 +505,6 @@ export function forgetLiveMode(): void {
  * before `setMode` would ever run.
  */
 export function rememberConnectedMode(): void {
+  removeSession(SNAPSHOT_ACCESS_KEY);
   writeSession(MODE_KEY, "connected");
 }

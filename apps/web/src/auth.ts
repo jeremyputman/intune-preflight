@@ -21,6 +21,7 @@ import {
 } from "@azure/msal-browser";
 import { buildMsalConfig, GRAPH_SCOPES, REDIRECT_HANDLING, resolveRedirectUri } from "./authConfig.ts";
 import type { LiveConfig } from "./liveConfig.ts";
+import { CacheAccessDenied } from "./tenantCache.ts";
 
 const SCOPES = [...GRAPH_SCOPES];
 
@@ -99,6 +100,31 @@ export async function signIn(): Promise<void> {
 let cachedToken: { token: string; expiresAt: number } | null = null;
 let inFlight: Promise<string> | null = null;
 
+/** Renew this account's delegated token before checking the cached reads. */
+export async function renewTenantCacheToken(): Promise<string> {
+  const selected = account;
+  if (!selected) throw new CacheAccessDenied("Sign in to verify access to the local tenant cache.");
+
+  const instance = requireApp();
+  const result = await instance
+    .acquireTokenSilent({ scopes: SCOPES, account: selected, forceRefresh: true })
+    .catch(async (error: unknown) => {
+      if (error instanceof InteractionRequiredAuthError && account === selected) {
+        await instance.acquireTokenRedirect({ scopes: SCOPES, account: selected, redirectUri: liveRedirectUri() });
+      }
+      throw error;
+    });
+  if (
+    account !== selected ||
+    result.account?.localAccountId !== selected.localAccountId ||
+    result.account?.tenantId !== selected.tenantId
+  ) {
+    throw new CacheAccessDenied("The signed-in account changed.");
+  }
+
+  return result.accessToken;
+}
+
 export async function acquireGraphToken(): Promise<string> {
   if (cachedToken && cachedToken.expiresAt > Date.now() + 30_000) return cachedToken.token;
   if (inFlight) return inFlight;
@@ -109,6 +135,7 @@ export async function acquireGraphToken(): Promise<string> {
       if (!account) throw new Error("Not signed in. Choose Connected to sign in to your tenant.");
       const request: SilentRequest = { scopes: SCOPES, account };
       const result = await instance.acquireTokenSilent(request);
+      if (account !== request.account) throw new Error("The signed-in account changed.");
       cachedToken = {
         token: result.accessToken,
         expiresAt: result.expiresOn ? result.expiresOn.getTime() : Date.now() + 3000 * 1000,

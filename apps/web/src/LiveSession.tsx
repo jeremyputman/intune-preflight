@@ -16,9 +16,11 @@ import { isValidClientId, isValidTenantId } from "./liveConfig.ts";
 import {
   cancelChangeTenant,
   changeLiveTenant,
+  clearLocalTenantCache,
   configureAndSignIn,
   endLiveSession,
   isChangingTenant,
+  PERSIST_TENANT_CACHE,
   readLiveConfig,
   signedInIdentity,
 } from "./liveSession.ts";
@@ -203,6 +205,8 @@ export function SessionLock() {
   const [open, setOpen] = useState(false);
   const [pinned, setPinned] = useState(false);
   const [ending, setEnding] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [clearError, setClearError] = useState<string | null>(null);
 
   if (!identity) return null;
 
@@ -216,6 +220,16 @@ export function SessionLock() {
   const close = () => {
     setPinned(false);
     setOpen(false);
+  };
+  const clearStoredData = async () => {
+    setClearing(true);
+    setClearError(null);
+    try {
+      await clearLocalTenantCache();
+    } catch (error) {
+      setClearError((error as Error).message);
+      setClearing(false);
+    }
   };
 
   return (
@@ -283,15 +297,33 @@ export function SessionLock() {
 
             <button
               onClick={endIt}
-              disabled={ending}
-              title="Discards the access token and the tenant data held in this tab, then reloads. Closing the tab does the same."
+              disabled={ending || clearing}
+              title={
+                PERSIST_TENANT_CACHE
+                  ? "Clears local tenant data and ends the session."
+                  : "Discards the access token and tenant data held in this tab."
+              }
               className="mt-2 w-full rounded border border-emerald-400/40 px-2 py-1.5 font-medium text-emerald-200 transition-colors hover:bg-emerald-500/20 disabled:opacity-50"
             >
               {ending ? "Ending…" : "End session"}
             </button>
+            {PERSIST_TENANT_CACHE && (
+              <button
+                onClick={clearStoredData}
+                disabled={ending || clearing}
+                className="mt-1.5 w-full rounded border border-ink-700 px-2 py-1.5 font-medium text-slate-300 hover:bg-ink-800 disabled:opacity-50"
+              >
+                {clearing ? "Clearing…" : "Clear local cache"}
+              </button>
+            )}
+            {clearError && (
+              <p role="alert" className="mt-1 text-red-300">
+                {clearError}
+              </p>
+            )}
             <button
               onClick={changeLiveTenant}
-              disabled={ending}
+              disabled={ending || clearing}
               title="Opens the setup form to correct or replace the tenant ID and client ID. You stay signed in until you save new ones."
               className="mt-1.5 w-full rounded border border-ink-700 px-2 py-1.5 font-medium text-slate-300 transition-colors hover:bg-ink-800 disabled:opacity-50"
             >

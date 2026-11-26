@@ -13,7 +13,15 @@ import { isWholeBaseline, type BaselineCriteria } from "@intune-preflight/engine
 import { demoApi } from "./demoApi.ts";
 import type { Download } from "./download.ts";
 import { createLiveApi } from "./liveApi.ts";
-import { ensureReady, ensureSignedIn, getToken, isConfigured, isSignedIn } from "./liveSession.ts";
+import {
+  ensureReady,
+  ensureSignedIn,
+  getToken,
+  isConfigured,
+  isSignedIn,
+  liveCachePersistence,
+  PERSIST_TENANT_CACHE,
+} from "./liveSession.ts";
 
 /**
  * When true, the app is the self-contained public demo: it runs the pure engine
@@ -109,12 +117,14 @@ export interface ServerStatus {
   loadWarnings?: string[];
   /** When the connected tenant data was read (ISO 8601); absent in demo or before the first load. */
   loadedAt?: string;
+  cacheMessage?: string;
 }
 
 /** What a refresh reports back: the reload's warnings and when it finished. */
 export interface RefreshResult {
   warnings: string[];
   loadedAt?: string;
+  cacheMessage?: string;
 }
 
 const serverApi = {
@@ -183,7 +193,14 @@ const serverApi = {
  * honest, and it is now what keeps `liveApi` honest too.
  */
 export const api: typeof serverApi = LIVE_MODE
-  ? createLiveApi({ ensureReady, getToken, ensureSignedIn, isSignedIn, isConfigured })
+  ? createLiveApi({
+      ensureReady,
+      getToken,
+      ensureSignedIn,
+      isSignedIn,
+      isConfigured,
+      persistence: PERSIST_TENANT_CACHE ? liveCachePersistence : undefined,
+    })
   : STATIC_DEMO
     ? demoApi
     : serverApi;

@@ -1058,7 +1058,8 @@ export async function readProfileRuleGroups(client: GraphClient): Promise<Intune
 export async function readGroupNesting(
   client: GraphClient,
   parents: IntuneGroup[],
-  catalog: IntuneGroup[]
+  catalog: IntuneGroup[],
+  recordWarning?: (message: string) => void
 ): Promise<IntuneGroup[]> {
   const byId = new Map(catalog.map((g) => [g.id, g]));
   const parentsOf = new Map<string, Set<string>>();
@@ -1084,7 +1085,7 @@ export async function readGroupNesting(
     }
   });
   if (failed > 0) {
-    console.warn(
+    (recordWarning ?? console.warn)(
       `Nested groups were not read for ${failed} group(s); a device reaching them through a nested group will not have them selected automatically.`
     );
   }
@@ -1127,9 +1128,16 @@ export interface LoadTenantDataOptions {
    * refresh, where a browser session's ends with the tab.
    */
   cache: TtlCache;
+  /** Include group-read failures in warnings when building a persistent snapshot. */
+  reportGroupFailures?: boolean;
 }
 
-export async function loadTenantData({ client, mode, cache }: LoadTenantDataOptions): Promise<TenantData> {
+export async function loadTenantData({
+  client,
+  mode,
+  cache,
+  reportGroupFailures = false,
+}: LoadTenantDataOptions): Promise<TenantData> {
   // Demo mode serves bundled sample data and never touches Graph. Cache keys are
   // per-mode so switching Demo <-> Connected doesn't require a manual refresh.
   if (mode === "demo") {
@@ -1215,6 +1223,7 @@ export async function loadTenantData({ client, mode, cache }: LoadTenantDataOpti
     // assigned to a deleted group) or unreadable -- in both cases Graph
     // returns no match; label it clearly rather than leaving a bare GUID.
     const found = new Set<string>();
+    let groupReadFailures = 0;
     const resolved = await mapWithConcurrency(realGroupIds, client.concurrency, async (id): Promise<IntuneGroup> => {
       const unresolvedLabel = `⚠ Deleted or inaccessible group (${id.slice(0, 8)}…)`;
       try {
@@ -1233,9 +1242,13 @@ export async function loadTenantData({ client, mode, cache }: LoadTenantDataOpti
           ...(match ? { portalUrl: entraGroupPortalUrl(id) } : {}),
         };
       } catch {
+        groupReadFailures++;
         return { id, displayName: unresolvedLabel };
       }
     });
+    if (reportGroupFailures && groupReadFailures > 0) {
+      ctx.recordWarning(`Could not resolve ${groupReadFailures} referenced group(s) from Microsoft Graph.`);
+    }
     groups.push(...resolved);
     // Nesting: a device in a group inside an assigned group is a member of the
     // assigned one too. Only groups Graph actually returned, and only assigned
@@ -1244,11 +1257,14 @@ export async function loadTenantData({ client, mode, cache }: LoadTenantDataOpti
       ...(await readGroupNesting(
         client,
         resolved.filter((g) => found.has(g.id) && !g.isDynamic),
-        groups
+        groups,
+        reportGroupFailures ? ctx.recordWarning : undefined
       ))
     );
 
     const profileRuleGroups = await readProfileRuleGroups(client);
+    if (reportGroupFailures && !profileRuleGroups)
+      ctx.recordWarning("Could not read dynamic enrollment profile rules.");
 
     // Resolve APv2 just-in-time device-group ids to display names now that the
     // referenced groups are loaded.

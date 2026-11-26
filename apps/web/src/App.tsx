@@ -5,6 +5,7 @@ import { EndpointSimulator } from "./EndpointSimulator.tsx";
 import { AssignmentReport } from "./AssignmentReport.tsx";
 import { LayoutToggle } from "./LayoutToggle.tsx";
 import { ChangeTenantButton, LiveFirstRunGate, SessionLock } from "./LiveSession.tsx";
+import { PERSIST_TENANT_CACHE } from "./liveSession.ts";
 import { PortalDemoContext } from "./portalDemo.ts";
 
 // Public repo, for the "deploy your own / self-host" nudges shown in demo mode.
@@ -65,6 +66,8 @@ export default function App() {
   // refresh dialog.
   // Undefined in demo and until the first connected load has finished.
   const [loadedAt, setLoadedAt] = useState<string | undefined>();
+  const [cacheMessage, setCacheMessage] = useState<string | undefined>();
+  const [refreshError, setRefreshError] = useState<string | null>(null);
 
   useEffect(() => {
     api
@@ -74,6 +77,7 @@ export default function App() {
         setHasCredentials(s.hasCredentials);
         setLoadWarnings(s.loadWarnings ?? []);
         setLoadedAt(s.loadedAt);
+        setCacheMessage(s.cacheMessage);
       })
       .catch(() => setDemo(null));
     // The first view load triggers the tenant fetch; keep polling health to pick
@@ -92,15 +96,32 @@ export default function App() {
             if (stopped) return;
             setLoadWarnings(s.loadWarnings ?? []);
             setLoadedAt(s.loadedAt);
+            setCacheMessage(s.cacheMessage);
             poll(s.loadedAt || s.demo ? 30_000 : 3000);
           })
           .catch(() => !stopped && poll(30_000));
       }, delay);
     };
     poll(3000);
+    const recheckVisibleCache = () => {
+      if (document.visibilityState !== "visible") return;
+      void api
+        .health()
+        .then((status) => {
+          if (!stopped) {
+            setLoadedAt(status.loadedAt);
+            setCacheMessage(status.cacheMessage);
+          }
+        })
+        .catch(() => {});
+    };
+    if (LIVE_MODE && PERSIST_TENANT_CACHE) {
+      document.addEventListener("visibilitychange", recheckVisibleCache);
+    }
     return () => {
       stopped = true;
       clearTimeout(timer);
+      document.removeEventListener("visibilitychange", recheckVisibleCache);
     };
   }, []);
 
@@ -124,14 +145,23 @@ export default function App() {
     setConfirmingRefresh(false);
     setRefreshing(true);
     setRefreshed(false);
+    setRefreshError(null);
     try {
-      const { warnings, loadedAt: readAt } = await api.refresh();
+      const { warnings, loadedAt: readAt, cacheMessage: message } = await api.refresh();
       setLoadWarnings(warnings);
       setLoadedAt(readAt);
+      setCacheMessage(message);
       if (keepSetup) setReloadToken((t) => t + 1);
       else setRefreshKey((k) => k + 1);
       setRefreshed(true);
       setTimeout(() => setRefreshed(false), 2500);
+    } catch (error) {
+      setRefreshError((error as Error).message);
+      const status = await api.health().catch(() => null);
+      if (status && LIVE_MODE && PERSIST_TENANT_CACHE) {
+        setLoadedAt(status.loadedAt);
+        setCacheMessage(status.cacheMessage);
+      }
     } finally {
       setRefreshing(false);
     }
@@ -146,6 +176,8 @@ export default function App() {
     if (switching || demo === (target === "demo")) return;
     setSwitching(true);
     setModeError(null);
+    setRefreshError(null);
+    setCacheMessage(undefined);
     try {
       const status = await api.setMode(target);
       setDemo(status.demo);
@@ -154,15 +186,19 @@ export default function App() {
       setLoadedAt(status.loadedAt);
       setRefreshKey((k) => k + 1); // remount views so they refetch from the new source
       if (target === "connected") {
-        setTimeout(() => {
-          api
-            .health()
-            .then((s) => {
-              setLoadWarnings(s.loadWarnings ?? []);
-              setLoadedAt(s.loadedAt);
-            })
-            .catch(() => {});
-        }, 3000);
+        setTimeout(
+          () => {
+            api
+              .health()
+              .then((s) => {
+                setLoadWarnings(s.loadWarnings ?? []);
+                setLoadedAt(s.loadedAt);
+                setCacheMessage(s.cacheMessage);
+              })
+              .catch(() => {});
+          },
+          LIVE_MODE && PERSIST_TENANT_CACHE ? 0 : 3000
+        );
       }
     } catch (e) {
       setModeError((e as Error).message);
@@ -465,6 +501,17 @@ export default function App() {
             </div>
           )}
 
+          {!demo && refreshError && (
+            <div role="alert" className="border-b border-red-500/20 bg-red-500/10 px-4 py-1 text-red-300">
+              {refreshError}
+            </div>
+          )}
+          {LIVE_MODE && PERSIST_TENANT_CACHE && demo === false && cacheMessage && (
+            <div role="status" className="border-b border-amber-400/30 px-4 py-1 text-xs text-amber-300">
+              {cacheMessage}
+            </div>
+          )}
+
           {/* Incomplete-load banner: the tenant fetch dropped something even after
           retries, so the baseline is missing data. Never let that be silent. */}
           {!demo && loadWarnings.length > 0 && (
@@ -504,7 +551,15 @@ export default function App() {
             sampleTenantChosen={sampleTenantChosen}
             onUseSampleTenant={() => setSampleTenantChosen(true)}
           >
-            <PortalDemoContext.Provider value={demo === true}>{views}</PortalDemoContext.Provider>
+            {PERSIST_TENANT_CACHE && demo === false && !loadedAt ? (
+              <div className="p-4 text-sm text-slate-300">
+                {cacheMessage && !refreshing
+                  ? "Tenant data is unavailable. Use Refresh from Intune to try again."
+                  : "Loading tenant data from Microsoft Graph."}
+              </div>
+            ) : (
+              <PortalDemoContext.Provider value={demo === true}>{views}</PortalDemoContext.Provider>
+            )}
           </LiveFirstRunGate>
         ) : (
           <PortalDemoContext.Provider value={demo === true}>{views}</PortalDemoContext.Provider>

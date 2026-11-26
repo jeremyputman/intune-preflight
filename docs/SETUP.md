@@ -193,6 +193,41 @@ If the deployed URL isn't `origin` + the `--base` path (a reverse proxy, say), s
 `VITE_REDIRECT_URI` at build time to the exact string registered in Entra; otherwise it is derived
 and you don't need it.
 
+#### Persistent browser snapshots
+
+Enable the local snapshot cache explicitly in a reviewed browser build:
+
+```bash
+VITE_PERSIST_TENANT_CACHE=1 PREFLIGHT_LIVE_BASE=/ npm run build:live
+```
+
+Use the same base path and redirect settings as your existing deployment. The app uses the
+signed-in user's existing delegated Graph permissions, including access granted through custom
+Intune roles. The cache stores only the tenant data available to that account.
+
+Connected mode automatically loads data if it has no saved snapshot. Reloading the page in the
+same signed-in tab reuses the saved data and its original load time for the remainder of the
+15-minute authorization window. Repeated reloads do not extend that window.
+If some Graph reads fail on the first load, the available data can still be
+saved, and the app indicates the incomplete load. An incomplete refresh preserves a
+previous complete snapshot while it remains authorized.
+
+The same account can reuse the snapshot from another tab or after restarting the browser
+in the same browser profile. Choose **Connected** and complete Entra sign-in when prompted.
+On a new session or after the tab's authorization window expires, the app obtains a fresh
+delegated token and makes up to five small Graph access checks, one per saved API area.
+Denied access clears the snapshot. An unavailable online check hides it until access can
+be verified. The checks establish access to those API areas. Object-level scope changes
+within an accessible area are reflected after **Refresh from Intune** reads fresh data.
+Device lookups remain live.
+
+Use **Clear local cache** in the session menu to delete the active snapshot and return to Demo.
+**End session** also deletes it and ends matching sessions in other open tabs. Closing a tab alone
+retains the snapshot.
+Use a dedicated managed browser profile and test sign-out, a second account, permission revocation,
+and offline behavior before enabling the feature on a production site. IndexedDB is local to the
+browser profile and origin. Browser settings can clear all the site's data.
+
 ---
 
 # Self-hosted
