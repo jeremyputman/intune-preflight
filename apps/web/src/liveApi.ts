@@ -56,7 +56,7 @@ import type { Download } from "./download.ts";
 import { setLoadProgress } from "./loadProgress.ts";
 import { readSession, removeSession, writeSession } from "./storage.ts";
 import { CacheAccessDenied, type CacheEntry, type TenantCache } from "./tenantCache.ts";
-import { createSnapshotReader } from "./snapshotAccess.ts";
+import { createSnapshotReader, verifySnapshotAccess } from "./snapshotAccess.ts";
 
 /**
  * Graph detail calls in flight at once. Lower than the server's eight: a browser
@@ -87,7 +87,7 @@ const SNAPSHOT_ACCESS_KEY = "preflight.live.snapshotAccess";
 const PROGRESS_TICK_MS = 400;
 const CACHE_AUTHORIZATION_MS = 15 * 60_000;
 const INCOMPLETE_SNAPSHOT_NOTICE =
-  "Some Graph reads failed. The available data is saved for reloads in this tab. Use Refresh from Intune to retry.";
+  "Some Graph reads failed when this snapshot was saved. Use Refresh from Intune to retry.";
 
 function readSnapshotAccess(key: string, revision: string): number | undefined {
   const saved = readSession(SNAPSHOT_ACCESS_KEY);
@@ -197,7 +197,8 @@ export function createLiveApi(deps: LiveApiDeps) {
     setRequestCount: (count: () => number) => void
   ): Promise<TenantData> {
     if (!persistence) throw new Error("Browser storage is unavailable.");
-    let { revision, data: previous, reads } = entry;
+    const { reads } = entry;
+    let { revision, data: previous } = entry;
     try {
       if (previous && reads && !refresh) {
         const expiresAt = readSnapshotAccess(key, revision);
@@ -216,28 +217,19 @@ export function createLiveApi(deps: LiveApiDeps) {
         requestCache: "no-store",
       });
       setRequestCount(() => lookupClient.getGraphStats().requests);
-      const reader = createSnapshotReader(lookupClient);
-      if (previous && reads && !refresh && !entry.retryIncomplete) {
-        if (await reader.matches(reads)) {
-          const current = await readCache(key);
-          stillCurrent();
-          if (!current || current.revision !== revision) {
-            throw new CacheAccessDenied("The local cache changed while it was being checked.");
-          }
-          cachedUntil = rememberSnapshotAccess(key, revision);
-          cacheMessage = undefined;
-          return previous;
-        }
-        // The old view no longer matches current Graph results. Rebuild from
-        // this account's responses and stop other tabs from using the old data.
+      if (previous && reads && !refresh) {
+        await verifySnapshotAccess(lookupClient, reads);
+        const current = await readCache(key);
         stillCurrent();
-        const clearedRevision = await purge(key, revision);
-        if (!clearedRevision) throw new CacheAccessDenied("The local cache changed while it was being checked.");
-        revision = clearedRevision;
-        previous = undefined;
-        reads = undefined;
+        if (!current || current.revision !== revision) {
+          throw new CacheAccessDenied("The local cache changed while it was being checked.");
+        }
+        cachedUntil = rememberSnapshotAccess(key, revision);
+        cacheMessage = entry.retryIncomplete ? INCOMPLETE_SNAPSHOT_NOTICE : undefined;
+        return previous;
       }
 
+      const reader = createSnapshotReader(lookupClient);
       const data = await loadTenantData({
         client: reader.client,
         mode: "connected",

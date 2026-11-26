@@ -1,8 +1,52 @@
 import { GraphHttpError, isGraphStatus, type GraphClient } from "@intune-preflight/graph";
 import { CacheAccessDenied, type SnapshotRead } from "./tenantCache.ts";
 
-// Hash the response rather than relying on HTTP 200: Intune can return a
-// smaller collection when scope tags or delegated permissions change.
+// Pick at most one collection for each API area that returned data in this
+// account's last load. Scoped roles may legitimately lack a different area.
+const PROBE_AREAS = [
+  ["/groups"],
+  [
+    "/deviceManagement/deviceConfigurations",
+    "/deviceManagement/configurationPolicies",
+    "/deviceManagement/deviceCompliancePolicies",
+    "/deviceManagement/groupPolicyConfigurations",
+    "/deviceManagement/assignmentFilters",
+    "/deviceManagement/intents",
+    "/deviceManagement/templates",
+    "/deviceManagement/groupPolicyCategories",
+  ],
+  ["/deviceManagement/windowsAutopilotDeploymentProfiles"],
+  ["/deviceManagement/deviceManagementScripts", "/deviceManagement/deviceShellScripts"],
+  ["/deviceAppManagement/mobileApps"],
+];
+
+export async function verifySnapshotAccess(client: GraphClient, reads: SnapshotRead[]): Promise<void> {
+  const successful = new Map(
+    reads
+      .filter((read) => read.collection && read.fingerprint.length === 64)
+      .map((read) => [read.path.split("?", 1)[0], read.beta])
+  );
+  const probes = PROBE_AREAS.flatMap((paths) => {
+    const path = paths.find((source) => successful.has(source));
+    return path ? [{ path, beta: successful.get(path) }] : [];
+  });
+  if (!probes.length) throw new CacheAccessDenied("No saved Graph access could be verified. Refresh from Intune.");
+
+  const results = await Promise.allSettled(
+    probes.map(async ({ path, beta }) => {
+      // Only the first page is needed to check the endpoint's current access.
+      const page = await client.graphGetObject<{ value?: unknown[] }>(`${path}?$select=id&$top=1`, beta);
+      if (!Array.isArray(page?.value)) throw new Error("Graph did not confirm access to the saved tenant data.");
+    })
+  );
+  if (results.some((result) => result.status === "rejected" && isGraphStatus(result.reason, 401, 403))) {
+    throw new CacheAccessDenied("Microsoft Graph denied access to a saved data area. Refresh from Intune.");
+  }
+  const failed = results.find((result) => result.status === "rejected");
+  if (failed) throw failed.reason;
+}
+
+// On a full refresh, compare responses before keeping or replacing older data.
 function canonical(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonical);
   if (value && typeof value === "object") {
@@ -72,19 +116,12 @@ export function createSnapshotReader(client: GraphClient) {
   }
 
   return {
-    // Reuse successful verification reads if a mismatched snapshot needs a
-    // fresh load, so those queries aren't issued twice.
+    // Deduplicate identical queries that occur during a full load.
     client: {
       ...client,
       graphGetObject: <T>(path: string, beta = false) => read<T>(path, beta, false),
       graphGetCollection: <T>(path: string, beta = false) => read<T[]>(path, beta, true),
     } satisfies GraphClient,
-    async matches(previous: SnapshotRead[]): Promise<boolean> {
-      const results = await client.mapWithConcurrency(previous, client.concurrency, (check) =>
-        observe(check.path, check.beta, check.collection)
-      );
-      return results.every((result, index) => result.read.fingerprint === previous[index].fingerprint);
-    },
     async observedChanges(previous: SnapshotRead[]): Promise<boolean> {
       const results = await Promise.all(
         previous.map(async (check) => {

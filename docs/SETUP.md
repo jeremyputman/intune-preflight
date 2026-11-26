@@ -209,16 +209,17 @@ Connected mode automatically loads data if it has no saved snapshot. Reloading t
 same signed-in tab reuses the saved data and its original load time for the remainder of the
 15-minute authorization window. Repeated reloads do not extend that window.
 If some Graph reads fail on the first load, the available data can still be
-saved for reloads during that window. The app indicates the incomplete load
-and retries it after the window expires. An incomplete refresh preserves a
+saved, and the app indicates the incomplete load. An incomplete refresh preserves a
 previous complete snapshot while it remains authorized.
 
-A new session, an expired authorization window, or a replaced snapshot requires an online check.
-The app renews the user's delegated token and checks the Graph responses that produced the
-snapshot. A successful response can still contain fewer objects after an Intune scope change,
-so the check compares the response contents. If the responses differ, the app rebuilds the
-snapshot using the current responses, reusing checks already made during that load.
-**Refresh from Intune** explicitly reads fresh data. Device lookups remain live.
+The same account can reuse the snapshot from another tab or after restarting the browser
+in the same browser profile. Choose **Connected** and complete Entra sign-in when prompted.
+On a new session or after the tab's authorization window expires, the app obtains a fresh
+delegated token and makes up to five small Graph access checks, one per saved API area.
+Denied access clears the snapshot. An unavailable online check hides it until access can
+be verified. The checks establish access to those API areas. Object-level scope changes
+within an accessible area are reflected after **Refresh from Intune** reads fresh data.
+Device lookups remain live.
 
 Use **Clear local cache** in the session menu to delete the active snapshot and return to Demo.
 **End session** also deletes it and ends matching sessions in other open tabs. Closing a tab alone

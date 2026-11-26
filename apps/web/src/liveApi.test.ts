@@ -150,8 +150,20 @@ describe("persistent tenant snapshots", () => {
     vi.restoreAllMocks();
   });
 
-  it("loads automatically, shares concurrent requests, and reopens an authorized snapshot", async () => {
-    const fetchMock = vi.fn(async (_url: string, _init: RequestInit) => graphResponse());
+  it("loads automatically and reopens in a fresh signed-in tab with at most five one-page checks", async () => {
+    browserTab();
+    const fetchMock = vi.fn(async (url: string, _init: RequestInit) => {
+      const response = graphResponse();
+      return url.includes("$select=id&$top=1")
+        ? {
+            ...response,
+            json: async () => ({
+              value: [],
+              "@odata.nextLink": "https://graph.microsoft.com/v1.0/groups?$skiptoken=next-page",
+            }),
+          }
+        : response;
+    });
     vi.stubGlobal("fetch", fetchMock);
     const { api, persistence, entries } = cache();
     await api.setMode("connected");
@@ -162,13 +174,18 @@ describe("persistent tenant snapshots", () => {
     const initialCalls = fetchMock.mock.calls.length;
 
     fetchMock.mockClear();
+    browserTab();
     const reopened = createLiveApi(deps({ persistence }));
+    expect((await reopened.health()).demo).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
     await reopened.setMode("connected");
     expect((await reopened.health()).loadedAt).toBe(loadedAt);
     expect(persistence.renewToken).toHaveBeenCalledTimes(1);
     expect(persistence.storage.write).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls).toHaveLength(entries.get("tenant:user")?.reads?.length ?? 0);
-    expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(initialCalls);
+    expect(fetchMock.mock.calls).toHaveLength(5);
+    expect(fetchMock.mock.calls.length).toBeLessThan(entries.get("tenant:user")?.reads?.length ?? 0);
+    expect(fetchMock.mock.calls.length).toBeLessThan(initialCalls);
+    expect(fetchMock.mock.calls.every(([url]) => url.includes("$select=id&$top=1"))).toBe(true);
     expect(fetchMock.mock.calls[0][1].headers).toMatchObject({ Authorization: "Bearer renewed delegated token" });
     expect(fetchMock.mock.calls[0][1].cache).toBe("no-store");
   });
@@ -198,7 +215,7 @@ describe("persistent tenant snapshots", () => {
     expect(fetchMock).toHaveBeenCalled();
   });
 
-  it("reuses a partial first load on reload and retries its failed reads after the window expires", async () => {
+  it("reopens a flagged partial snapshot and retries failed reads on explicit refresh", async () => {
     browserTab();
     let groupsUnavailable = true;
     const fetchMock = vi.fn(async (url: string) => {
@@ -224,7 +241,9 @@ describe("persistent tenant snapshots", () => {
     groupsUnavailable = false;
     clock.mockReturnValue(16 * 60_000);
     const expired = createLiveApi(deps({ persistence, isSignedIn: () => true }));
-    expect((await expired.health()).cacheMessage).toBeUndefined();
+    expect((await expired.health()).cacheMessage).toContain("Some Graph reads failed");
+    expect(fetchMock.mock.calls.some(([url]) => url.includes("groupTypes"))).toBe(false);
+    await expired.refresh();
     expect(fetchMock.mock.calls.some(([url]) => url.includes("groupTypes"))).toBe(true);
     expect(entries.get("tenant:user")?.retryIncomplete).toBe(false);
   });
@@ -292,6 +311,25 @@ describe("persistent tenant snapshots", () => {
     expect(persistence.notifyPurge).toHaveBeenCalledWith("tenant:user");
   });
 
+  it("purges the snapshot when Graph denies one of the access checks", async () => {
+    let denyAccess = false;
+    vi.stubGlobal("fetch", async (url: string) =>
+      graphResponse([], denyAccess && url.includes("/groups?") ? 403 : 200)
+    );
+    const { api, entries, persistence } = cache();
+    await api.setMode("connected");
+    await api.health();
+
+    denyAccess = true;
+    const reopened = createLiveApi(deps({ persistence }));
+    await reopened.setMode("connected");
+    expect(await reopened.health()).toMatchObject({
+      cacheMessage: expect.stringContaining("Microsoft Graph denied access"),
+    });
+    expect((await reopened.health()).loadedAt).toBeUndefined();
+    expect(entries.get("tenant:user")?.data).toBeUndefined();
+  });
+
   it("locks a restored snapshot when revalidation fails and keeps it on disk after a transient error", async () => {
     vi.stubGlobal("fetch", async () => graphResponse());
     const { api, entries, persistence } = cache();
@@ -352,7 +390,7 @@ describe("persistent tenant snapshots", () => {
     expect((await api.health()).loadedAt).toBeUndefined();
   });
 
-  it("saves a scoped account's available data and replaces it when access shrinks", async () => {
+  it("saves a scoped account's data and replaces it on refresh after access shrinks", async () => {
     const { api, entries, persistence } = cache();
     const policy = (id: string) => ({
       id,
@@ -376,6 +414,11 @@ describe("persistent tenant snapshots", () => {
     const reopened = createLiveApi(deps({ persistence }));
     await reopened.setMode("connected");
     expect((await reopened.health()).loadedAt).toBeDefined();
+    expect(entries.get("tenant:user")?.data?.policies.map(({ id }) => id)).toEqual(["scope-a", "scope-b"]);
+    expect(fetchMock.mock.calls.every(([url]) => url.includes("$select=id&$top=1"))).toBe(true);
+
+    fetchMock.mockClear();
+    await reopened.refresh();
     expect(entries.get("tenant:user")?.data?.policies.map(({ id }) => id)).toEqual(["scope-a"]);
     expect(persistence.notifyPurge).toHaveBeenCalledWith("tenant:user");
     expect(fetchMock.mock.calls.filter(([url]) => url.includes("deviceConfigurations?"))).toHaveLength(1);

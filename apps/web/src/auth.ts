@@ -105,11 +105,12 @@ export async function renewTenantCacheToken(): Promise<string> {
   const selected = account;
   if (!selected) throw new CacheAccessDenied("Sign in to verify access to the local tenant cache.");
 
-  const result = await requireApp()
+  const instance = requireApp();
+  const result = await instance
     .acquireTokenSilent({ scopes: SCOPES, account: selected, forceRefresh: true })
-    .catch((error: unknown) => {
-      if (error instanceof InteractionRequiredAuthError) {
-        throw new CacheAccessDenied("Entra requires a new sign-in to verify access to the local tenant cache.");
+    .catch(async (error: unknown) => {
+      if (error instanceof InteractionRequiredAuthError && account === selected) {
+        await instance.acquireTokenRedirect({ scopes: SCOPES, account: selected, redirectUri: liveRedirectUri() });
       }
       throw error;
     });
