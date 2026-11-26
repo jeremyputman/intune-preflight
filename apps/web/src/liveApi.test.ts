@@ -13,7 +13,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { demoApi } from "./demoApi.ts";
-import { createLiveApi, type LiveApiDeps, type PersistentTenantCache } from "./liveApi.ts";
+import { createLiveApi, forgetLiveMode, type LiveApiDeps, type PersistentTenantCache } from "./liveApi.ts";
 import { CacheAccessDenied, type CacheEntry } from "./tenantCache.ts";
 
 function deps(overrides: Partial<LiveApiDeps> = {}): LiveApiDeps {
@@ -116,9 +116,10 @@ describe("persistent tenant snapshots", () => {
       storage: {
         read: vi.fn(async (key: string) => entries.get(key) ?? { revision: "" }),
         write: vi.fn<PersistentTenantCache["storage"]["write"]>(async (key, revision, data, reads) => {
-          if ((entries.get(key)?.revision ?? "") !== revision) return false;
-          entries.set(key, { revision: String(++nextRevision), data, reads });
-          return true;
+          if ((entries.get(key)?.revision ?? "") !== revision) return undefined;
+          const savedRevision = String(++nextRevision);
+          entries.set(key, { revision: savedRevision, data, reads });
+          return savedRevision;
         }),
         clear: vi.fn<PersistentTenantCache["storage"]["clear"]>(async (key, expected) => {
           if (expected !== undefined && (entries.get(key)?.revision ?? "") !== expected) return undefined;
@@ -133,6 +134,15 @@ describe("persistent tenant snapshots", () => {
 
   function graphResponse(value: unknown[] = [], status = 200) {
     return { ok: status === 200, status, json: async () => ({ value }), text: async () => "Graph response" };
+  }
+
+  function browserTab() {
+    const items = new Map<string, string>();
+    vi.stubGlobal("sessionStorage", {
+      getItem: (key: string) => items.get(key) ?? null,
+      setItem: (key: string, value: string) => items.set(key, value),
+      removeItem: (key: string) => items.delete(key),
+    });
   }
 
   afterEach(() => {
@@ -161,6 +171,68 @@ describe("persistent tenant snapshots", () => {
     expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(initialCalls);
     expect(fetchMock.mock.calls[0][1].headers).toMatchObject({ Authorization: "Bearer renewed delegated token" });
     expect(fetchMock.mock.calls[0][1].cache).toBe("no-store");
+  });
+
+  it("reloads a matching snapshot in the same signed-in tab without repeating Graph reads", async () => {
+    browserTab();
+    const fetchMock = vi.fn(async () => graphResponse());
+    vi.stubGlobal("fetch", fetchMock);
+    const { api, persistence } = cache();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(0);
+    await api.setMode("connected");
+    const { loadedAt } = await api.health();
+    expect(loadedAt).toBeDefined();
+
+    fetchMock.mockClear();
+    clock.mockReturnValue(14 * 60_000);
+    const reloaded = createLiveApi(deps({ persistence, isSignedIn: () => true }));
+    expect((await reloaded.health()).loadedAt).toBe(loadedAt);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(persistence.renewToken).not.toHaveBeenCalled();
+    expect(persistence.storage.write).toHaveBeenCalledTimes(1);
+
+    clock.mockReturnValue(16 * 60_000);
+    const expired = createLiveApi(deps({ persistence, isSignedIn: () => true }));
+    expect((await expired.health()).loadedAt).toBe(loadedAt);
+    expect(persistence.renewToken).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalled();
+  });
+
+  it("does not reuse tab authorization for a replacement snapshot or after ending the session", async () => {
+    browserTab();
+    vi.stubGlobal("fetch", async () => graphResponse());
+    const { api, entries, persistence } = cache();
+    await api.setMode("connected");
+    expect((await api.health()).loadedAt).toBeDefined();
+
+    const prior = entries.get("tenant:user")!;
+    entries.set("tenant:user", { ...prior, revision: "written in a different tab" });
+    const replaced = createLiveApi(deps({ persistence, isSignedIn: () => true }));
+    expect((await replaced.health()).loadedAt).toBe(prior.data?.loadedAt);
+    expect(persistence.renewToken).toHaveBeenCalledTimes(1);
+
+    forgetLiveMode();
+    const signedBackIn = createLiveApi(deps({ persistence, isSignedIn: () => true }));
+    await signedBackIn.setMode("connected");
+    expect((await signedBackIn.health()).loadedAt).toBe(prior.data?.loadedAt);
+    expect(persistence.renewToken).toHaveBeenCalledTimes(2);
+  });
+
+  it("still reads Graph when Refresh from Intune is requested in the same tab", async () => {
+    browserTab();
+    const fetchMock = vi.fn(async () => graphResponse());
+    vi.stubGlobal("fetch", fetchMock);
+    const { api, persistence } = cache();
+    await api.setMode("connected");
+    await api.health();
+    fetchMock.mockClear();
+
+    const reloaded = createLiveApi(deps({ persistence, isSignedIn: () => true }));
+    await reloaded.health();
+    await reloaded.refresh();
+    expect(fetchMock).toHaveBeenCalled();
+    expect(persistence.renewToken).toHaveBeenCalledTimes(1);
+    expect(persistence.storage.write).toHaveBeenCalledTimes(2);
   });
 
   it("automatically downloads an isolated snapshot for a different signed-in user", async () => {

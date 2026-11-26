@@ -19,7 +19,7 @@ export interface SnapshotRead {
 
 export interface TenantCache {
   read(key: string): Promise<CacheEntry>;
-  write(key: string, revision: string, data: TenantData, reads: SnapshotRead[]): Promise<boolean>;
+  write(key: string, revision: string, data: TenantData, reads: SnapshotRead[]): Promise<string | undefined>;
   clear(key: string, expectedRevision?: string): Promise<string | undefined>;
 }
 
@@ -101,11 +101,12 @@ export const tenantCache: TenantCache = {
       request.onsuccess = () => {
         const current: CacheEntry | undefined = request.result;
         if ((current?.revision ?? "") !== revision) {
-          finish(false);
+          finish(undefined);
           return;
         }
-        store.put({ revision: crypto.randomUUID(), data, reads } satisfies CacheEntry, key);
-        finish(true);
+        const nextRevision = crypto.randomUUID();
+        store.put({ revision: nextRevision, data, reads } satisfies CacheEntry, key);
+        finish(nextRevision);
       };
     }),
   // A tombstone blocks writes that started before a clear, including from

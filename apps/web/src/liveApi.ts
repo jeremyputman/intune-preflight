@@ -81,10 +81,37 @@ const TAB_LIFETIME_SECONDS = 24 * 60 * 60;
  * scoped like the token itself.
  */
 const MODE_KEY = "preflight.live.mode";
+const SNAPSHOT_ACCESS_KEY = "preflight.live.snapshotAccess";
 
 /** How often the progress counter is republished during a load. */
 const PROGRESS_TICK_MS = 400;
 const CACHE_AUTHORIZATION_MS = 15 * 60_000;
+
+function readSnapshotAccess(key: string, revision: string): number | undefined {
+  const saved = readSession(SNAPSHOT_ACCESS_KEY);
+  if (!saved) return;
+  try {
+    const access: { key: string; revision: string; expiresAt: number } | null = JSON.parse(saved);
+    const now = Date.now();
+    if (
+      access?.key === key &&
+      access.revision === revision &&
+      Number.isFinite(access.expiresAt) &&
+      access.expiresAt > now &&
+      access.expiresAt <= now + CACHE_AUTHORIZATION_MS
+    ) {
+      return access.expiresAt;
+    }
+  } catch {
+    // A missing or invalid tab record requires an online check.
+  }
+}
+
+function rememberSnapshotAccess(key: string, revision: string): number {
+  const expiresAt = Date.now() + CACHE_AUTHORIZATION_MS;
+  writeSession(SNAPSHOT_ACCESS_KEY, JSON.stringify({ key, revision, expiresAt }));
+  return expiresAt;
+}
 
 export interface PersistentTenantCache {
   storage: TenantCache;
@@ -170,6 +197,15 @@ export function createLiveApi(deps: LiveApiDeps) {
     if (!persistence) throw new Error("Browser storage is unavailable.");
     let { revision, data: previous, reads } = entry;
     try {
+      if (previous && reads && !refresh) {
+        const expiresAt = readSnapshotAccess(key, revision);
+        if (expiresAt !== undefined) {
+          cachedUntil = expiresAt;
+          cacheMessage = undefined;
+          return previous;
+        }
+      }
+
       const token = previous ? await persistence.renewToken() : undefined;
       stillCurrent();
       const lookupClient = createGraphClient({
@@ -186,7 +222,7 @@ export function createLiveApi(deps: LiveApiDeps) {
           if (!current || current.revision !== revision) {
             throw new CacheAccessDenied("The local cache changed while it was being checked.");
           }
-          cachedUntil = Date.now() + CACHE_AUTHORIZATION_MS;
+          cachedUntil = rememberSnapshotAccess(key, revision);
           cacheMessage = undefined;
           return previous;
         }
@@ -228,11 +264,14 @@ export function createLiveApi(deps: LiveApiDeps) {
       cachedUntil = undefined;
       if (cacheable) {
         try {
-          if (!(await persistence.storage.write(key, revision, data, manifest))) {
+          const savedRevision = await persistence.storage.write(key, revision, data, manifest);
+          if (!savedRevision) {
             throw new CacheAccessDenied("The local cache was cleared during the refresh.");
           }
+          stillCurrent();
+          if (key !== persistence.key()) throw new CacheAccessDenied("The signed-in account changed.");
           cacheMessage = undefined;
-          cachedUntil = Date.now() + CACHE_AUTHORIZATION_MS;
+          cachedUntil = rememberSnapshotAccess(key, savedRevision);
         } catch (error) {
           if (error instanceof CacheAccessDenied) throw error;
           cacheMessage = "The browser could not save the tenant snapshot. The data is available in this tab.";
@@ -243,6 +282,7 @@ export function createLiveApi(deps: LiveApiDeps) {
       return data;
     } catch (error) {
       if (previous && error instanceof CacheAccessDenied) await purge(key, revision);
+      if (error instanceof CacheAccessDenied) removeSession(SNAPSHOT_ACCESS_KEY);
       throw error;
     }
   }
@@ -387,6 +427,7 @@ export function createLiveApi(deps: LiveApiDeps) {
       if (target === "connected") {
         // Remember the intent BEFORE signing in: `ensureSignedIn` may navigate
         // to Entra, and what we want on the way back is Connected.
+        if (!deps.isSignedIn()) removeSession(SNAPSHOT_ACCESS_KEY);
         writeSession(MODE_KEY, "connected");
         setLoadProgress({ phase: "signing-in", requests: 0 });
         try {
@@ -458,6 +499,7 @@ export function createLiveApi(deps: LiveApiDeps) {
  */
 export function forgetLiveMode(): void {
   removeSession(MODE_KEY);
+  removeSession(SNAPSHOT_ACCESS_KEY);
 }
 
 /**
@@ -466,5 +508,6 @@ export function forgetLiveMode(): void {
  * before `setMode` would ever run.
  */
 export function rememberConnectedMode(): void {
+  removeSession(SNAPSHOT_ACCESS_KEY);
   writeSession(MODE_KEY, "connected");
 }

@@ -205,13 +205,16 @@ Use the same base path and redirect settings as your existing deployment. The ap
 signed-in user's existing delegated Graph permissions, including access granted through custom
 Intune roles. The cache stores only the tenant data available to that account.
 
-Connected mode automatically loads data if it has no saved snapshot. When reopening a saved
-snapshot, the app renews the user's delegated token and checks the Graph responses that produced
-it. A successful response can still contain fewer objects after an Intune scope change, so the
-check compares the response contents. Graph requests are still required on reopen. If the
-responses match, the app reuses the saved snapshot and preserves its original load time. If
-they differ, it rebuilds the snapshot using the current responses, reusing checks already made
-during that load. Device lookups remain live.
+Connected mode automatically loads data if it has no saved snapshot. Reloading the page in the
+same signed-in tab reuses the saved data and its original load time for the remainder of the
+15-minute authorization window. Repeated reloads do not extend that window.
+
+A new session, an expired authorization window, or a replaced snapshot requires an online check.
+The app renews the user's delegated token and checks the Graph responses that produced the
+snapshot. A successful response can still contain fewer objects after an Intune scope change,
+so the check compares the response contents. If the responses differ, the app rebuilds the
+snapshot using the current responses, reusing checks already made during that load.
+**Refresh from Intune** explicitly reads fresh data. Device lookups remain live.
 
 Use **Clear local cache** in the session menu to delete the active snapshot and return to Demo.
 **End session** also deletes it and ends matching sessions in other open tabs. Closing a tab alone
