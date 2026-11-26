@@ -39,6 +39,7 @@ import {
 import {
   createGraphClient,
   loadTenantData,
+  readDeviceGroup,
   readDeviceMembership,
   searchDevices,
   type TenantMode,
@@ -55,7 +56,7 @@ import type {
 import type { Download } from "./download.ts";
 import { setLoadProgress } from "./loadProgress.ts";
 import { readSession, removeSession, writeSession } from "./storage.ts";
-import { CacheAccessDenied, type CacheEntry, type TenantCache } from "./tenantCache.ts";
+import { CacheAccessDenied, cachedGroupIds, type CacheEntry, type TenantCache } from "./tenantCache.ts";
 import { createSnapshotReader, verifySnapshotAccess } from "./snapshotAccess.ts";
 
 /**
@@ -400,6 +401,47 @@ export function createLiveApi(deps: LiveApiDeps) {
       ? loaded
       : EMPTY_TENANT;
 
+  async function deviceMembership(id: string): Promise<DeviceMembershipResponse> {
+    if ((await ensureMode()) === "demo") return { unavailable: DEVICE_LOOKUP_DEMO };
+    const key = persistence?.key();
+    if (!key || !persistence) return readDeviceMembership(client, id);
+
+    const lookupGeneration = generation;
+    const [result, entry] = await Promise.all([
+      readDeviceMembership(client, id),
+      persistence.storage.read(key).catch(() => undefined),
+    ]);
+    const sameSession = () => generation === lookupGeneration && persistence.key() === key;
+    if (!entry?.data || !sameSession() || "unavailable" in result) return result;
+
+    const known = cachedGroupIds(entry);
+    const candidates = new Map(
+      result.membership.groups
+        .filter((group) => group.displayName === group.id || !known.has(group.id.toLowerCase()))
+        .map((group) => [group.id.toLowerCase(), group])
+    );
+    if (!candidates.size) return result;
+
+    const groups = await client.mapWithConcurrency([...candidates.values()], client.concurrency, async (group) =>
+      group.displayName !== group.id ? group : readDeviceGroup(client, group.id)
+    );
+    if (!sameSession()) return result;
+    const resolved = groups.filter((group) => group !== undefined);
+    if (!resolved.length) return result;
+    const discovered = resolved.filter((group) => !known.has(group.id.toLowerCase()));
+    if (discovered.length) {
+      await persistence.storage.addDiscoveredGroups(key, entry.revision, discovered).catch(() => {});
+    }
+
+    const byId = new Map(resolved.map((group) => [group.id.toLowerCase(), group]));
+    return {
+      membership: {
+        ...result.membership,
+        groups: result.membership.groups.map((group) => byId.get(group.id.toLowerCase()) ?? group),
+      },
+    };
+  }
+
   return {
     health: async (): Promise<ServerStatus> => {
       // Await a load already in flight so the caller's warnings are the real
@@ -456,8 +498,7 @@ export function createLiveApi(deps: LiveApiDeps) {
       (await ensureMode()) === "demo"
         ? { unavailable: DEVICE_LOOKUP_DEMO }
         : searchDevices(client, query, includeInactive),
-    deviceMembership: async (id: string): Promise<DeviceMembershipResponse> =>
-      (await ensureMode()) === "demo" ? { unavailable: DEVICE_LOOKUP_DEMO } : readDeviceMembership(client, id),
+    deviceMembership,
     unassignedPolicies: async () => listUnassignedPolicies(await tenant()),
     assignmentReport: async (platform?: Platform) => buildAssignmentReport(await tenant(), platform),
     assignmentReportExport: (platform?: Platform, format: ManifestExportFormat = "csv") => {

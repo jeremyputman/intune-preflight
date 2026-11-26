@@ -1,4 +1,5 @@
 import type { TenantData } from "@intune-preflight/engine";
+import type { DeviceMembership } from "@intune-preflight/shared";
 
 const DATABASE = "intune-preflight";
 const VERSION = 2;
@@ -9,6 +10,7 @@ export interface CacheEntry {
   data?: TenantData;
   reads?: SnapshotRead[];
   retryIncomplete?: boolean;
+  discoveredGroups?: DeviceMembership["groups"];
 }
 
 export interface SnapshotRead {
@@ -27,7 +29,16 @@ export interface TenantCache {
     reads: SnapshotRead[],
     retryIncomplete: boolean
   ): Promise<string | undefined>;
+  addDiscoveredGroups(key: string, revision: string, groups: DeviceMembership["groups"]): Promise<void>;
   clear(key: string, expectedRevision?: string): Promise<string | undefined>;
+}
+
+export function cachedGroupIds(entry: CacheEntry): Set<string> {
+  return new Set(
+    [entry.data?.groups, entry.data?.profileRuleGroups, entry.discoveredGroups].flatMap(
+      (groups) => groups?.map(({ id }) => id.toLowerCase()) ?? []
+    )
+  );
 }
 
 function openCache(): Promise<IDBDatabase> {
@@ -114,6 +125,28 @@ export const tenantCache: TenantCache = {
         const nextRevision = crypto.randomUUID();
         store.put({ revision: nextRevision, data, reads, retryIncomplete } satisfies CacheEntry, key);
         finish(nextRevision);
+      };
+    }),
+  addDiscoveredGroups: (key, revision, groups) =>
+    transact("readwrite", (store, finish) => {
+      const request = store.get(key);
+      request.onsuccess = () => {
+        const current: CacheEntry | undefined = request.result;
+        if (current?.data && current.revision === revision) {
+          const known = cachedGroupIds(current);
+          const extras = groups.filter(({ id }) => {
+            const key = id.toLowerCase();
+            if (known.has(key)) return false;
+            known.add(key);
+            return true;
+          });
+          if (extras.length) {
+            // Keep the snapshot's revision and timestamp. The write records
+            // group metadata independently of any device or assignment.
+            store.put({ ...current, discoveredGroups: [...(current.discoveredGroups ?? []), ...extras] }, key);
+          }
+        }
+        finish(undefined);
       };
     }),
   // A tombstone blocks writes that started before a clear, including from
