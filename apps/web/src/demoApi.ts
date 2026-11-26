@@ -55,7 +55,7 @@ export const demoApi = {
   filters: () => ok(listAssignmentFilters(data())),
   profileNameWarnings: () => ok(listProfileNameWarnings(data())),
   // The sample tenant's ids are made up; there is no device behind any of them.
-  searchDevices: (_query: string, _signal?: AbortSignal) =>
+  searchDevices: (_query: string, _signal?: AbortSignal, _includeInactive?: boolean) =>
     ok<DeviceSearchResponse>({ unavailable: DEVICE_LOOKUP_DEMO }),
   deviceMembership: (_id: string) => ok<DeviceMembershipResponse>({ unavailable: DEVICE_LOOKUP_DEMO }),
   unassignedPolicies: () => ok(listUnassignedPolicies(data())),

@@ -694,8 +694,8 @@ export type DeviceSearchResponse =
       devices: DeviceSearchResult[];
       /**
        * Devices that matched the name but were left out because Intune does not
-       * manage them, they are disabled, or they have not signed in for
-       * DEVICE_ACTIVE_DAYS days.
+       * manage them, they are disabled, or the default sign-in recency filter
+       * excluded them.
        */
       hidden?: number;
     }

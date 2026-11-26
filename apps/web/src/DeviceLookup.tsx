@@ -55,11 +55,6 @@ function filterLine(filters: { displayName: string; matches: boolean }[]): strin
  * machine is in that nobody expected. Everything it sets stays editable
  * afterwards, so it is a starting point, not a lock.
  */
-/** Says how many name matches the search left out, and why. */
-function hiddenNote(n: number): string {
-  return `${n} more ${n === 1 ? "is" : "are"} hidden: not managed by Intune, disabled, or not signed in for ${DEVICE_ACTIVE_DAYS} days.`;
-}
-
 export function DeviceLookup({
   loaded,
   onLoad,
@@ -70,6 +65,7 @@ export function DeviceLookup({
   onClear: () => void;
 }) {
   const [query, setQuery] = useState("");
+  const [includeInactive, setIncludeInactive] = useState(false);
   const [results, setResults] = useState<DeviceSearchResult[]>([]);
   const [hidden, setHidden] = useState(0);
   const [searching, setSearching] = useState(false);
@@ -90,10 +86,13 @@ export function DeviceLookup({
     }
     const controller = new AbortController();
     setSearching(true);
+    setError(null);
+    setUnavailable(null);
     const timer = setTimeout(() => {
       api
-        .searchDevices(text, controller.signal)
+        .searchDevices(text, controller.signal, includeInactive)
         .then((res) => {
+          if (controller.signal.aborted) return;
           if ("unavailable" in res) {
             setUnavailable(res.unavailable);
             setResults([]);
@@ -106,7 +105,7 @@ export function DeviceLookup({
           setError(null);
         })
         .catch((e) => {
-          if (e.name !== "AbortError") setError(e.message);
+          if (!controller.signal.aborted && e.name !== "AbortError") setError(e.message);
         })
         .finally(() => !controller.signal.aborted && setSearching(false));
     }, 300);
@@ -114,7 +113,7 @@ export function DeviceLookup({
       clearTimeout(timer);
       controller.abort();
     };
-  }, [query]);
+  }, [query, includeInactive]);
 
   // Close the result list on a click elsewhere or Escape.
   useEffect(() => {
@@ -151,6 +150,10 @@ export function DeviceLookup({
   };
 
   const showList = open && query.trim().length >= 2;
+  const hiddenReasons = includeInactive
+    ? "disabled or unmanaged by Intune"
+    : `disabled, unmanaged by Intune, or last signed in to Entra over ${DEVICE_ACTIVE_DAYS} days ago`;
+  const hiddenNote = `${hidden} more ${hidden === 1 ? "device is" : "devices are"} hidden (${hiddenReasons}).`;
 
   return (
     <div ref={boxRef}>
@@ -161,6 +164,20 @@ export function DeviceLookup({
         Start from a real device{" "}
         <span className="font-normal normal-case tracking-normal text-slate-500">(optional)</span>
       </div>
+      <label
+        className="mb-1.5 flex w-fit items-center gap-1.5 text-[11px] text-slate-400"
+        title={`Include Intune devices whose last Entra sign-in was more than ${DEVICE_ACTIVE_DAYS} days ago.`}
+      >
+        <input
+          type="checkbox"
+          checked={includeInactive}
+          onChange={(e) => {
+            setIncludeInactive(e.target.checked);
+            setOpen(true);
+          }}
+        />
+        Include inactive Intune devices
+      </label>
       <div className="relative">
         <input
           value={query}
@@ -179,12 +196,12 @@ export function DeviceLookup({
               <div className="px-2.5 py-2 text-[11px] leading-relaxed text-amber-300">{unavailable.detail}</div>
             ) : error ? (
               <div className="px-2.5 py-2 text-[11px] text-red-400">{error}</div>
-            ) : searching && results.length === 0 ? (
+            ) : searching ? (
               <div className="px-2.5 py-2 text-[11px] text-slate-500">Searching…</div>
             ) : results.length === 0 ? (
               <div className="px-2.5 py-2 text-[11px] leading-relaxed text-slate-500">
                 {hidden > 0
-                  ? `No active Intune-managed device name starts with that. ${hiddenNote(hidden)}`
+                  ? `No ${includeInactive ? "enabled" : "active"} Intune-managed device name starts with that. ${hiddenNote}`
                   : "No device name starts with that."}
               </div>
             ) : (
@@ -206,7 +223,7 @@ export function DeviceLookup({
                   </button>
                 ))}
                 {hidden > 0 && (
-                  <div className="px-2.5 py-1.5 text-[10px] leading-relaxed text-slate-500">{hiddenNote(hidden)}</div>
+                  <div className="px-2.5 py-1.5 text-[10px] leading-relaxed text-slate-500">{hiddenNote}</div>
                 )}
               </>
             )}
